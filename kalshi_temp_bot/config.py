@@ -15,7 +15,16 @@ from typing import List, Optional
 try:  # optional dependency; the bot still runs if python-dotenv is absent
     from dotenv import load_dotenv
 
-    load_dotenv()
+    load_dotenv()  # a .env in the working directory (handy for development)
+    try:
+        from .paths import env_file_path
+
+        _user_env = env_file_path()
+        if _user_env.exists():
+            # The installed app / GUI persists settings here; let it win.
+            load_dotenv(_user_env, override=True)
+    except Exception:  # pragma: no cover - defensive
+        pass
 except Exception:  # pragma: no cover - dotenv is a convenience only
     pass
 
@@ -161,3 +170,19 @@ class Config:
             order_api=_get_str("KALSHI_ORDER_API", "v2").lower(),
             request_timeout=_get_float("REQUEST_TIMEOUT", 10.0),
         )
+
+
+def save_settings(env_values: dict) -> str:
+    """Persist GUI settings as a ``.env`` in the per-user config directory.
+
+    Returns the path written. Values are written verbatim as ``KEY=VALUE`` lines.
+    """
+    from .paths import ensure_config_dir, env_file_path
+
+    ensure_config_dir()
+    path = env_file_path()
+    lines = ["# Saved by the Kalshi Temperature Bot GUI -- edit with care.", ""]
+    for key, value in env_values.items():
+        lines.append(f"{key}={'' if value is None else value}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(path)

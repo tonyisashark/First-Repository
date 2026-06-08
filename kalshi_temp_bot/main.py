@@ -17,8 +17,7 @@ from typing import List, Optional
 from . import money
 from .bot import TradingBot
 from .config import Config
-from .kalshi_client import KalshiAuth, KalshiClient
-from .kalshi_ws import KalshiWebSocket, MarketDataCache
+from .factory import build_auth, build_bot, build_client
 from .strategy import select_buy_candidates
 
 
@@ -30,51 +29,15 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
-def _build_auth(cfg: Config) -> Optional[KalshiAuth]:
-    if not cfg.has_credentials:
-        return None
-    try:
-        return KalshiAuth.load(cfg.api_key_id, cfg.private_key_path, cfg.private_key_pem)
-    except Exception as exc:  # noqa: BLE001
-        logging.getLogger(__name__).error("Failed to load API credentials: %s", exc)
-        return None
-
-
-def _build_client(cfg: Config, auth: Optional[KalshiAuth]) -> KalshiClient:
-    return KalshiClient(
-        api_base=cfg.api_base,
-        auth=auth,
-        timeout=cfg.request_timeout,
-        order_api=cfg.order_api,
-    )
-
-
 def cmd_run(cfg: Config) -> int:
     log = logging.getLogger(__name__)
-    auth = _build_auth(cfg)
+    bot, auth = build_bot(cfg)
 
     if not cfg.dry_run and auth is None:
         log.error("Live trading requested (DRY_RUN=false) but no valid API credentials found. Aborting.")
         return 2
     if not cfg.dry_run and cfg.env == "prod":
         log.warning("LIVE TRADING ON PRODUCTION -- real money is at risk.")
-
-    client = _build_client(cfg, auth)
-    cache: Optional[MarketDataCache] = None
-    ws: Optional[KalshiWebSocket] = None
-
-    bot = TradingBot(client=client, config=cfg, cache=None, ws=None)
-
-    if cfg.use_websocket and auth is not None:
-        cache = MarketDataCache()
-        ws = KalshiWebSocket(
-            ws_base=cfg.ws_base,
-            auth=auth,
-            cache=cache,
-            tickers_provider=bot.current_tickers,
-        )
-        bot.cache = cache
-        bot.ws = ws
 
     def _handle_signal(signum, _frame):
         log.info("Received signal %s -- shutting down", signum)
@@ -89,8 +52,8 @@ def cmd_run(cfg: Config) -> int:
 
 def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
     """Public, read-only view of monitored markets and which ones are buy candidates."""
-    auth = _build_auth(cfg)
-    client = _build_client(cfg, auth)
+    auth = build_auth(cfg)
+    client = build_client(cfg, auth)
     series_list = series_override or cfg.temperature_series
 
     views = []
@@ -132,11 +95,11 @@ def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
 
 
 def cmd_balance(cfg: Config) -> int:
-    auth = _build_auth(cfg)
+    auth = build_auth(cfg)
     if auth is None:
         print("No API credentials configured -- cannot fetch balance.")
         return 2
-    client = _build_client(cfg, auth)
+    client = build_client(cfg, auth)
     data = client.get_balance()
     bal = money.balance_cents(data)
     pv = money.portfolio_value_cents(data)
@@ -145,6 +108,13 @@ def cmd_balance(cfg: Config) -> int:
         print(f"Portfolio value   : ${pv / 100:,.2f}")
     print(f"One-trade budget  : ${int(bal * cfg.portfolio_fraction) / 100:,.2f} "
           f"(= {cfg.portfolio_fraction:.1%} of balance)")
+    return 0
+
+
+def cmd_gui() -> int:
+    from .gui import main as gui_main
+
+    gui_main()
     return 0
 
 
@@ -157,11 +127,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_list = sub.add_parser("list-markets", help="list monitored markets and candidates (public)")
     p_list.add_argument("--series", help="comma-separated series tickers to inspect")
     sub.add_parser("balance", help="show account balance (requires credentials)")
+    sub.add_parser("gui", help="launch the graphical interface")
 
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
-    cfg = Config.from_env()
 
+    if args.command == "gui":
+        return cmd_gui()
+
+    cfg = Config.from_env()
     if args.command == "run":
         return cmd_run(cfg)
     if args.command == "list-markets":

@@ -79,6 +79,23 @@ currently satisfy the buy rule. Put the tickers you want into
 
 ## Run
 
+### Desktop GUI
+
+```bash
+python -m kalshi_temp_bot gui
+```
+
+A control panel with a **Dashboard** (Start/Stop, live state/position/balance,
+streaming log) and a **Settings** tab (every knob, saved per-user). It starts in
+paper mode; flip *Dry run* off and provide credentials to trade live.
+
+**Windows installer:** `build_windows.bat` produces `KalshiTempBotSetup.exe`,
+which installs a standalone app (no Python needed), a **Desktop shortcut**, and a
+**Start Menu entry** so it's searchable in Windows. See
+[INSTALL_WINDOWS.md](INSTALL_WINDOWS.md).
+
+### Command line
+
 ```bash
 # Paper-trade against live PROD market data (safe: reads are public, no orders):
 KALSHI_ENV=prod DRY_RUN=true python -m kalshi_temp_bot run
@@ -156,13 +173,19 @@ A few points in the spec needed a concrete reading; these are the choices made
 
 ```
 kalshi_temp_bot/
-  config.py         env-driven configuration
+  config.py         env-driven configuration (+ per-user settings save)
+  paths.py          per-user config directory (%APPDATA% / ~/.config)
   money.py          dollar/cent/fixed-point unit helpers
   kalshi_client.py  REST client + RSA request signing + order schemas
   kalshi_ws.py      realtime WebSocket ticker feed (optional accelerator)
   strategy.py       pure, tested decision logic
   bot.py            the IDLE→BUYING→HOLDING→EXITING state machine
-  main.py           CLI (run / list-markets / balance)
+  factory.py        builds a wired bot from config (shared by CLI + GUI)
+  gui.py            Tkinter desktop GUI
+  main.py           CLI (run / list-markets / balance / gui)
+gui_app.py          PyInstaller entry point for the GUI
+kalshi_temp_bot.spec / build_windows.bat / installer/  Windows packaging
+assets/make_icon.py generates the app icon
 tests/              strategy & money unit tests
 ```
 

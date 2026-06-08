@@ -1,0 +1,4 @@
+# Build-time dependencies for producing the Windows executable/installer.
+# (Runtime deps are in requirements.txt; Tkinter ships with the official
+#  python.org Windows installer.)
+pyinstaller>=6.0
