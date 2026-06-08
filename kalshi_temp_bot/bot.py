@@ -37,6 +37,10 @@ from .strategy import (
 
 logger = logging.getLogger(__name__)
 
+# Seconds to wait between successive per-series market requests during a scan,
+# so a multi-city scan doesn't burst past Kalshi's rate limit.
+SERIES_REQUEST_SPACING = 0.15
+
 
 class State(Enum):
     IDLE = "idle"
@@ -115,7 +119,10 @@ class TradingBot:
         """Return the current market universe, scanned via REST and overlaid with
         the freshest realtime prices from the WebSocket cache."""
         now = time.time()
-        if not self._market_cache or (now - self._last_scan) >= self.cfg.scan_interval_seconds:
+        # Throttle by the scan interval -- *including* when the last scan came
+        # back empty. (Re-scanning every tick on an empty result would hammer
+        # the API and trigger continuous rate limiting that never recovers.)
+        if self._last_scan == 0.0 or (now - self._last_scan) >= self.cfg.scan_interval_seconds:
             self._scan_markets()
             self._last_scan = now
 
@@ -136,7 +143,11 @@ class TradingBot:
 
     def _scan_markets(self) -> None:
         views: List[MarketView] = []
-        for series in self.cfg.temperature_series:
+        for index, series in enumerate(self.cfg.temperature_series):
+            if index > 0 and SERIES_REQUEST_SPACING > 0:
+                # Spread requests out so a multi-city scan doesn't burst past
+                # Kalshi's per-second rate limit.
+                time.sleep(SERIES_REQUEST_SPACING)
             try:
                 raw_markets = self.client.get_markets(series_ticker=series, status="open")
             except Exception as exc:
@@ -146,7 +157,15 @@ class TradingBot:
                 views.append(self._to_view(raw))
         self._market_cache = views
         self._current_tickers = [v.ticker for v in views]
-        logger.debug("Scanned %d open temperature markets", len(views))
+        if not views:
+            logger.warning(
+                "Scan found 0 open markets for series %s on env '%s'. "
+                "Check that the series tickers exist on this environment "
+                "(temperature markets live on 'prod').",
+                ",".join(self.cfg.temperature_series), self.cfg.env,
+            )
+        else:
+            logger.debug("Scanned %d open temperature markets", len(views))
 
     @staticmethod
     def _to_view(raw: dict) -> MarketView:
