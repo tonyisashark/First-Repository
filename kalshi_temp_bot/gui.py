@@ -47,6 +47,7 @@ SETTINGS_FIELDS = [
     ("FORCE_SELL_BUFFER_SECONDS", "Force-sell before close (s)", "text", None),
     ("MIN_SECONDS_TO_CLOSE", "Don't enter if closing within (s)", "text", None),
     ("BUY_TIMEOUT_SECONDS", "Cancel unfilled buy after (s)", "text", None),
+    ("HEARTBEAT_INTERVAL_SECONDS", "Heartbeat status log interval (s)", "text", None),
     ("USE_WEBSOCKET", "Use realtime WebSocket feed", "bool", None),
     ("KALSHI_ORDER_API", "Order API", "choice", ["v2", "legacy"]),
 ]
@@ -70,6 +71,7 @@ def cfg_to_env_values(cfg: Config) -> Dict[str, str]:
         "FORCE_SELL_BUFFER_SECONDS": str(cfg.force_sell_buffer_seconds),
         "MIN_SECONDS_TO_CLOSE": str(cfg.min_seconds_to_close),
         "BUY_TIMEOUT_SECONDS": str(cfg.buy_timeout_seconds),
+        "HEARTBEAT_INTERVAL_SECONDS": f"{cfg.heartbeat_interval_seconds:g}",
         "USE_WEBSOCKET": "true" if cfg.use_websocket else "false",
         "KALSHI_ORDER_API": cfg.order_api,
     }

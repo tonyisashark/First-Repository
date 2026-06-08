@@ -28,6 +28,7 @@ from .kalshi_client import KalshiClient
 from .kalshi_ws import KalshiWebSocket, MarketDataCache
 from .strategy import (
     MarketView,
+    idle_watch_summary,
     parse_time,
     pick_best_candidate,
     position_size,
@@ -71,6 +72,7 @@ class TradingBot:
 
         self._market_cache: List[MarketView] = []
         self._last_scan: float = 0.0
+        self._last_heartbeat: float = 0.0
         self._current_tickers: List[str] = []
         self._running = False
 
@@ -105,6 +107,7 @@ class TradingBot:
     # -- main step ---------------------------------------------------------
     def tick(self) -> None:
         markets = self._get_markets()
+        self._maybe_heartbeat(markets)
         if self.state is State.IDLE:
             self._try_enter(markets)
         elif self.state is State.BUYING:
@@ -113,6 +116,43 @@ class TradingBot:
             self._manage_holding(markets)
         elif self.state is State.EXITING:
             self._check_exit()
+
+    # -- heartbeat ---------------------------------------------------------
+    def _maybe_heartbeat(self, markets: List[MarketView]) -> None:
+        """Periodically log a status line so an idle (silent) bot is visibly alive.
+
+        Fires immediately on the first tick, then every ``heartbeat_interval_seconds``.
+        """
+        now = time.time()
+        if self._last_heartbeat != 0.0 and (now - self._last_heartbeat) < self.cfg.heartbeat_interval_seconds:
+            return
+        self._last_heartbeat = now
+        try:
+            logger.info("Heartbeat: %s", self._heartbeat_message(markets))
+        except Exception:  # noqa: BLE001 - a status line must never break the loop
+            logger.debug("heartbeat formatting failed", exc_info=True)
+
+    def _heartbeat_message(self, markets: List[MarketView]) -> str:
+        if self.state is State.HOLDING and self.position:
+            market = self._market_for(markets, self.position["ticker"])
+            bid = market.yes_bid if market else None
+            stc = seconds_to_close(market) if market else None
+            closes = f"; closes in {int(stc // 60)}m" if stc is not None else ""
+            bid_txt = f"{bid}c" if bid is not None else "?"
+            return (f"holding {self.position['ticker']} x{self.position['count']} | "
+                    f"sell target {self.cfg.sell_yes_price_cents}c, bid {bid_txt}{closes}")
+        if self.state is State.BUYING and self.position:
+            return (f"buying {self.position['ticker']} x{self.position['count']} "
+                    f"@ {self.cfg.buy_yes_price_cents}c -- awaiting fill")
+        if self.state is State.EXITING and self.position:
+            return f"force-exiting {self.position['ticker']} -- flattening before close"
+        return idle_watch_summary(
+            markets,
+            target_yes_price_cents=self.cfg.buy_yes_price_cents,
+            volume_threshold_ratio=self.cfg.volume_threshold_ratio,
+            scope=self.cfg.max_volume_scope,
+            min_seconds_to_close=self.cfg.min_seconds_to_close,
+        )
 
     # -- market data -------------------------------------------------------
     def _get_markets(self) -> List[MarketView]:

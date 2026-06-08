@@ -121,6 +121,7 @@ class Config:
     force_sell_buffer_seconds: int = 60    # force-exit this long before market close
     min_seconds_to_close: int = 300        # don't open a trade in a market closing this soon
     buy_timeout_seconds: int = 30          # cancel an unfilled entry order after this long
+    heartbeat_interval_seconds: float = 30.0  # how often to log an "I'm alive" status line
 
     # --- order routing ---
     order_api: str = "v2"  # "v2" -> /portfolio/events/orders ; "legacy" -> /portfolio/orders
@@ -167,6 +168,7 @@ class Config:
             force_sell_buffer_seconds=_get_int("FORCE_SELL_BUFFER_SECONDS", 60),
             min_seconds_to_close=_get_int("MIN_SECONDS_TO_CLOSE", 300),
             buy_timeout_seconds=_get_int("BUY_TIMEOUT_SECONDS", 30),
+            heartbeat_interval_seconds=_get_float("HEARTBEAT_INTERVAL_SECONDS", 30.0),
             order_api=_get_str("KALSHI_ORDER_API", "v2").lower(),
             request_timeout=_get_float("REQUEST_TIMEOUT", 10.0),
         )

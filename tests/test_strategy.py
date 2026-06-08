@@ -6,11 +6,13 @@ import pytest
 
 from kalshi_temp_bot.strategy import (
     MarketView,
+    idle_watch_summary,
     parse_time,
     pick_best_candidate,
     position_size,
     seconds_to_close,
     select_buy_candidates,
+    volume_qualifying_markets,
 )
 
 NOW = datetime(2026, 6, 8, 12, 0, 0, tzinfo=timezone.utc)
@@ -142,3 +144,38 @@ def test_seconds_to_close():
 
 def test_seconds_to_close_unknown():
     assert seconds_to_close(mk("X"), now=NOW) is None
+
+
+# --- volume_qualifying_markets --------------------------------------------
+def test_volume_qualifying_global():
+    markets = [mk("MAX", volume=300, yes_ask=10), mk("OK", volume=200), mk("LOW", volume=199)]
+    got = {m.ticker for m in volume_qualifying_markets(
+        markets, volume_threshold_ratio=2 / 3, scope="global")}
+    assert got == {"MAX", "OK"}  # price is irrelevant to the volume filter
+
+
+# --- idle_watch_summary ----------------------------------------------------
+def test_idle_summary_reports_counts_and_closest():
+    markets = [
+        mk("MAX", volume=300, yes_ask=92),   # qualifies on volume, ask 92 (closest to 90)
+        mk("FAR", volume=300, yes_ask=40),   # qualifies on volume, ask far from 90
+        mk("LOW", volume=10, yes_ask=90),    # at 90 but fails volume -> not a candidate
+    ]
+    summary = idle_watch_summary(
+        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+    assert "watching 3 markets" in summary
+    assert "0 at 90c" in summary
+    assert "closest qualifying MAX ask 92c" in summary
+
+
+def test_idle_summary_empty():
+    assert "watching 0 markets" in idle_watch_summary(
+        [], target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+
+
+def test_idle_summary_hides_closest_when_candidate_exists():
+    markets = [mk("HIT", volume=300, yes_ask=90)]
+    summary = idle_watch_summary(
+        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+    assert "1 at 90c" in summary
+    assert "closest" not in summary

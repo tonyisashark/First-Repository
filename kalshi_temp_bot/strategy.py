@@ -57,6 +57,36 @@ def seconds_to_close(market: MarketView, now: Optional[datetime] = None) -> Opti
     return (market.close_time - now).total_seconds()
 
 
+def _group_markets(markets: List[MarketView], scope: str) -> Dict[str, List[MarketView]]:
+    groups: Dict[str, List[MarketView]] = {}
+    for market in markets:
+        key = "__global__" if scope == "global" else market.event_ticker
+        groups.setdefault(key, []).append(market)
+    return groups
+
+
+def volume_qualifying_markets(
+    markets: List[MarketView],
+    *,
+    volume_threshold_ratio: float,
+    scope: str = "global",
+) -> List[MarketView]:
+    """Markets whose volume is >= ``volume_threshold_ratio`` of their group's
+    maximum-volume market (ignoring price). The shared volume filter used by both
+    the buy rule and the heartbeat."""
+    qualifying: List[MarketView] = []
+    for group in _group_markets(markets, scope).values():
+        volumes = [m.volume for m in group if m.volume is not None]
+        if not volumes:
+            continue
+        max_volume = max(volumes)
+        if max_volume <= 0:
+            continue
+        threshold = volume_threshold_ratio * max_volume
+        qualifying.extend(m for m in group if m.volume is not None and m.volume >= threshold)
+    return qualifying
+
+
 def select_buy_candidates(
     markets: List[MarketView],
     *,
@@ -80,30 +110,17 @@ def select_buy_candidates(
     """
     now = now or datetime.now(timezone.utc)
 
-    groups: Dict[str, List[MarketView]] = {}
-    for market in markets:
-        key = "__global__" if scope == "global" else market.event_ticker
-        groups.setdefault(key, []).append(market)
-
     candidates: List[MarketView] = []
-    for group in groups.values():
-        volumes = [m.volume for m in group if m.volume is not None]
-        if not volumes:
+    for market in volume_qualifying_markets(
+        markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
+    ):
+        if market.yes_ask != target_yes_price_cents:
             continue
-        max_volume = max(volumes)
-        if max_volume <= 0:
-            continue
-        threshold = volume_threshold_ratio * max_volume
-        for market in group:
-            if market.volume is None or market.volume < threshold:
+        if min_seconds_to_close is not None:
+            stc = seconds_to_close(market, now)
+            if stc is not None and stc < min_seconds_to_close:
                 continue
-            if market.yes_ask != target_yes_price_cents:
-                continue
-            if min_seconds_to_close is not None:
-                stc = seconds_to_close(market, now)
-                if stc is not None and stc < min_seconds_to_close:
-                    continue
-            candidates.append(market)
+        candidates.append(market)
     return candidates
 
 
@@ -124,3 +141,48 @@ def position_size(balance_cents: int, portfolio_fraction: float, price_cents: in
         return 0
     budget_cents = int(balance_cents * portfolio_fraction)
     return budget_cents // price_cents
+
+
+def idle_watch_summary(
+    markets: List[MarketView],
+    *,
+    target_yes_price_cents: int,
+    volume_threshold_ratio: float,
+    scope: str = "global",
+    min_seconds_to_close: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """One-line, human-readable summary of what the bot is watching while idle.
+
+    Reports how many markets/events are tracked, how many currently match the buy
+    rule, and (if none do) the volume-qualifying market whose ask is closest to the
+    target -- i.e. how close the bot is to triggering.
+    """
+    if not markets:
+        return "watching 0 markets -- check Environment=prod and the series tickers"
+
+    now = now or datetime.now(timezone.utc)
+    n_events = len({m.event_ticker for m in markets})
+    candidates = select_buy_candidates(
+        markets,
+        target_yes_price_cents=target_yes_price_cents,
+        volume_threshold_ratio=volume_threshold_ratio,
+        scope=scope,
+        min_seconds_to_close=min_seconds_to_close,
+        now=now,
+    )
+    parts = [
+        f"watching {len(markets)} markets / {n_events} events",
+        f"{len(candidates)} at {target_yes_price_cents}c",
+    ]
+    qualifying = [
+        m
+        for m in volume_qualifying_markets(
+            markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
+        )
+        if m.yes_ask is not None
+    ]
+    if qualifying and not candidates:
+        closest = min(qualifying, key=lambda m: abs(m.yes_ask - target_yes_price_cents))
+        parts.append(f"closest qualifying {closest.ticker} ask {closest.yes_ask}c")
+    return " | ".join(parts)
