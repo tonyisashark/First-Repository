@@ -101,9 +101,9 @@ class Config:
     sell_yes_price_cents: int = 99         # resting sell target
     volume_threshold_ratio: float = 2.0 / 3.0   # >= 2/3 of the max-volume market
     portfolio_fraction: float = 1.0 / 3.0       # deploy 1/3 of the portfolio per trade
-    # "event"  -> max volume is computed within each event (one city/day) [default]
-    # "global" -> max volume is the single highest-volume market across all monitored
-    max_volume_scope: str = "event"
+    # "global" -> max volume is the single highest-volume market across all monitored [default]
+    # "event"  -> max volume is computed within each event (one city/day)
+    max_volume_scope: str = "global"
 
     # --- timing ---
     poll_interval_seconds: float = 1.0     # how often the decision loop runs
@@ -151,7 +151,7 @@ class Config:
             sell_yes_price_cents=_get_int("SELL_YES_PRICE_CENTS", 99),
             volume_threshold_ratio=_get_float("VOLUME_THRESHOLD_RATIO", 2.0 / 3.0),
             portfolio_fraction=_get_float("PORTFOLIO_FRACTION", 1.0 / 3.0),
-            max_volume_scope=_get_str("MAX_VOLUME_SCOPE", "event").lower(),
+            max_volume_scope=_get_str("MAX_VOLUME_SCOPE", "global").lower(),
             poll_interval_seconds=_get_float("POLL_INTERVAL_SECONDS", 1.0),
             scan_interval_seconds=_get_float("SCAN_INTERVAL_SECONDS", 5.0),
             use_websocket=_get_bool("USE_WEBSOCKET", True),

@@ -62,7 +62,7 @@ def select_buy_candidates(
     *,
     target_yes_price_cents: int,
     volume_threshold_ratio: float,
-    scope: str = "event",
+    scope: str = "global",
     min_seconds_to_close: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> List[MarketView]:
@@ -73,9 +73,10 @@ def select_buy_candidates(
     ``target_yes_price_cents``.
 
     ``scope`` controls the comparison group for "maximum volume":
+      * ``"global"`` -> compared against the single highest-volume range market
+        across every monitored market at once -- the default.
       * ``"event"``  -> compared against other range markets in the same event
-        (same city/day) -- the default and the most apples-to-apples reading.
-      * ``"global"`` -> compared against every monitored market at once.
+        (same city/day).
     """
     now = now or datetime.now(timezone.utc)
 

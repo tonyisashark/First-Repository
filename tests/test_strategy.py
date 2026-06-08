@@ -85,6 +85,18 @@ def test_event_scope_isolates_max_per_event():
     assert got == {"CHI_MAX", "CHI_OK"}
 
 
+def test_default_scope_is_global():
+    # With no scope argument the single global max governs: CHI_MAX is excluded
+    # because NY_BIG's volume dominates across all monitored markets.
+    markets = [
+        mk("NY_BIG", event="NY", volume=900, yes_ask=10),
+        mk("CHI_MAX", event="CHI", volume=120, yes_ask=90),
+    ]
+    got = {m.ticker for m in select_buy_candidates(
+        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
+    assert got == set()
+
+
 def test_global_scope_uses_single_max():
     markets = [
         mk("NY_BIG", event="NY", volume=900, yes_ask=10),

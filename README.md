@@ -38,9 +38,10 @@ simple, fully-specified rule set:
 example, for "High in New York" on a given day there are many bucket markets
 (…, 72–73°, 74–75°, …); the bot compares each bucket's own volume against the
 **highest-volume single bucket**, not against the summed volume of the whole NY
-event. By default this comparison is done **within each event** (`event` scope);
-set `MAX_VOLUME_SCOPE=global` to compare every monitored market against one
-overall maximum.
+event. By default this comparison is **global** (`global` scope): every
+monitored range market is measured against the single highest-volume range
+market across all monitored markets. Set `MAX_VOLUME_SCOPE=event` to instead
+compare within each event (one city/day).
 
 Because only one trade runs at a time, when several markets qualify the bot
 enters the **highest-volume** one.
@@ -117,7 +118,7 @@ All settings are environment variables (see `.env.example`). Highlights:
 | `SELL_YES_PRICE_CENTS` | `99` | resting sell target |
 | `VOLUME_THRESHOLD_RATIO` | `0.6667` | fraction of max volume required (2/3) |
 | `PORTFOLIO_FRACTION` | `0.3333` | fraction of portfolio per trade (1/3) |
-| `MAX_VOLUME_SCOPE` | `event` | `event` or `global` volume comparison |
+| `MAX_VOLUME_SCOPE` | `global` | `global` or `event` volume comparison |
 | `POLL_INTERVAL_SECONDS` | `1.0` | decision-loop cadence |
 | `SCAN_INTERVAL_SECONDS` | `5.0` | REST market re-scan cadence |
 | `USE_WEBSOCKET` | `true` | realtime ticker updates |
