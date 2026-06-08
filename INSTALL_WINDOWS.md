@@ -5,6 +5,21 @@ pipeline that produces a Windows installer. The installer drops a **Start Menu
 entry** (so the app shows up in Windows Search) and an optional **Desktop
 shortcut**, and registers an uninstaller under *Apps & features*.
 
+## Easiest: download a prebuilt installer (GitHub Actions)
+
+You don't need to build anything yourself — a GitHub Actions workflow builds the
+installer on Windows for you:
+
+1. Open the repository on GitHub → **Actions** tab.
+2. Click the most recent **"Build Windows installer"** run (or press **Run
+   workflow** to start one).
+3. Wait for it to finish (green check), then scroll to **Artifacts** and download
+   **`KalshiTempBot-Windows`**.
+4. Unzip it and run **`KalshiTempBotSetup.exe`**.
+
+(The zip also contains `KalshiTempBot.exe`, the standalone app, if you'd rather
+skip the installer.)
+
 ## For end users (installed app)
 
 1. Run **`KalshiTempBotSetup.exe`**.
