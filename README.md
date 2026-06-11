@@ -7,8 +7,12 @@ simple, fully-specified rule set:
   the maximum-volume range market**, but **only when the YES ask is exactly
   90¢**.
 - **Size:** deploy **1/3 of the current portfolio** on each trade.
-- **Exit:** rest a sell at **exactly 99¢**.
-- **One at a time:** only a single trade is ever in flight.
+- **Exit:** rest a sell at **exactly 99¢** (take-profit), with an optional
+  **stop-loss** (`MIN_SELL_PRICE_CENTS`) that sells once the bid falls to/below a
+  floor.
+- **Concurrency:** up to **`MAX_POSITIONS`** positions at once (default 1). A
+  position whose market has no exit liquidity (no YES bid) doesn't consume a slot,
+  so a stuck position can't block new trades.
 - **No overnight risk:** if a position hasn't sold by the time the market is
   about to close (midnight), it is **force-sold regardless of price** so nothing
   is held through the close.
@@ -132,7 +136,9 @@ All settings are environment variables (see `.env.example`). Highlights:
 | `DRY_RUN` | `true` | `true` = paper trade (no real orders) |
 | `TEMPERATURE_SERIES` | built-in list | comma-separated series tickers to monitor |
 | `BUY_YES_PRICE_CENTS` | `90` | exact YES ask required to buy |
-| `SELL_YES_PRICE_CENTS` | `99` | resting sell target |
+| `SELL_YES_PRICE_CENTS` | `99` | resting sell (take-profit) target |
+| `MIN_SELL_PRICE_CENTS` | `0` | stop-loss: sell if YES bid ≤ this (`0` = off) |
+| `MAX_POSITIONS` | `1` | max concurrent positions (no-liquidity ones don't count) |
 | `VOLUME_THRESHOLD_RATIO` | `0.6667` | fraction of max volume required (2/3) |
 | `PORTFOLIO_FRACTION` | `0.3333` | fraction of portfolio per trade (1/3) |
 | `MAX_VOLUME_SCOPE` | `global` | `global` or `event` volume comparison |

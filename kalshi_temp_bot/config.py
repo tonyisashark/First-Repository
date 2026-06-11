@@ -107,7 +107,12 @@ class Config:
 
     # --- strategy parameters ---
     buy_yes_price_cents: int = 90          # buy YES only when the ask is exactly this
-    sell_yes_price_cents: int = 99         # resting sell target
+    sell_yes_price_cents: int = 99         # resting sell (take-profit) target
+    # Stop-loss: if the YES bid falls to or below this, sell the position. 0 = off.
+    min_sell_price_cents: int = 0
+    # Maximum number of concurrent positions. A position whose market has no exit
+    # liquidity (no YES bid) does NOT count against this cap.
+    max_positions: int = 1
     volume_threshold_ratio: float = 2.0 / 3.0   # >= 2/3 of the max-volume market
     portfolio_fraction: float = 1.0 / 3.0       # deploy 1/3 of the portfolio per trade
     # "global" -> max volume is the single highest-volume market across all monitored [default]
@@ -159,6 +164,8 @@ class Config:
             temperature_series=series,
             buy_yes_price_cents=_get_int("BUY_YES_PRICE_CENTS", 90),
             sell_yes_price_cents=_get_int("SELL_YES_PRICE_CENTS", 99),
+            min_sell_price_cents=_get_int("MIN_SELL_PRICE_CENTS", 0),
+            max_positions=_get_int("MAX_POSITIONS", 1),
             volume_threshold_ratio=_get_float("VOLUME_THRESHOLD_RATIO", 2.0 / 3.0),
             portfolio_fraction=_get_float("PORTFOLIO_FRACTION", 1.0 / 3.0),
             max_volume_scope=_get_str("MAX_VOLUME_SCOPE", "global").lower(),

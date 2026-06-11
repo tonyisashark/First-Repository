@@ -57,6 +57,16 @@ def seconds_to_close(market: MarketView, now: Optional[datetime] = None) -> Opti
     return (market.close_time - now).total_seconds()
 
 
+def has_liquidity(market: MarketView) -> bool:
+    """True if the YES ask is a real, tradeable price (strictly between the rails).
+
+    A bucket pinned at 0/1c (settled loser) or 99/100c (settled winner) has no
+    meaningful two-sided liquidity, so it shouldn't be surfaced as a near-target
+    market.
+    """
+    return market.yes_ask is not None and 1 < market.yes_ask < 99
+
+
 def _group_markets(markets: List[MarketView], scope: str) -> Dict[str, List[MarketView]]:
     groups: Dict[str, List[MarketView]] = {}
     for market in markets:
@@ -175,12 +185,14 @@ def idle_watch_summary(
         f"watching {len(markets)} markets / {n_events} events",
         f"{len(candidates)} at {target_yes_price_cents}c",
     ]
+    # Only consider markets with real liquidity (ignore rail-priced 0/1/99/100
+    # buckets) when reporting the closest market to the buy price.
     qualifying = [
         m
         for m in volume_qualifying_markets(
             markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
         )
-        if m.yes_ask is not None
+        if has_liquidity(m)
     ]
     if qualifying and not candidates:
         closest = min(qualifying, key=lambda m: abs(m.yes_ask - target_yes_price_cents))

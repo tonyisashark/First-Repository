@@ -39,6 +39,8 @@ SETTINGS_FIELDS = [
     ("TEMPERATURE_SERIES", "Temperature series (comma-separated, blank = defaults)", "text", None),
     ("BUY_YES_PRICE_CENTS", "Buy YES at exactly (cents)", "text", None),
     ("SELL_YES_PRICE_CENTS", "Sell YES at (cents)", "text", None),
+    ("MIN_SELL_PRICE_CENTS", "Stop-loss: sell if bid <= (cents, 0=off)", "text", None),
+    ("MAX_POSITIONS", "Max concurrent positions", "text", None),
     ("VOLUME_THRESHOLD_RATIO", "Volume threshold ratio (2/3)", "text", None),
     ("PORTFOLIO_FRACTION", "Portfolio fraction per trade (1/3)", "text", None),
     ("MAX_VOLUME_SCOPE", "Max-volume comparison scope", "choice", ["global", "event"]),
@@ -63,6 +65,8 @@ def cfg_to_env_values(cfg: Config) -> Dict[str, str]:
         "TEMPERATURE_SERIES": ",".join(cfg.temperature_series),
         "BUY_YES_PRICE_CENTS": str(cfg.buy_yes_price_cents),
         "SELL_YES_PRICE_CENTS": str(cfg.sell_yes_price_cents),
+        "MIN_SELL_PRICE_CENTS": str(cfg.min_sell_price_cents),
+        "MAX_POSITIONS": str(cfg.max_positions),
         "VOLUME_THRESHOLD_RATIO": f"{cfg.volume_threshold_ratio:.10g}",
         "PORTFOLIO_FRACTION": f"{cfg.portfolio_fraction:.10g}",
         "MAX_VOLUME_SCOPE": cfg.max_volume_scope,
@@ -369,14 +373,24 @@ class BotGUI:
             self.status_vars["markets"].set("-")
             self.status_vars["position"].set("none")
         else:
-            self.status_vars["state"].set(self.bot.state.value + ("" if running else " (stopped)"))
+            trades = list(getattr(self.bot, "trades", []))
+            if not running:
+                self.status_vars["state"].set("stopped")
+            else:
+                self.status_vars["state"].set(
+                    "idle" if not trades else f"{len(trades)} position(s)")
             try:
                 self.status_vars["markets"].set(str(len(self.bot.current_tickers())))
             except Exception:
                 self.status_vars["markets"].set("-")
-            pos = self.bot.position
-            self.status_vars["position"].set(
-                f"{pos['ticker']} x{pos['count']}" if pos else "none")
+            if not trades:
+                self.status_vars["position"].set("none")
+            else:
+                shown = ", ".join(f"{t.ticker} x{t.count}" for t in trades[:2])
+                if len(trades) > 2:
+                    shown += f" +{len(trades) - 2}"
+                self.status_vars["position"].set(
+                    f"{shown}  (max {cfg.max_positions})")
 
         self.status_vars["balance"].set(
             "-" if self._balance_cents is None else f"${self._balance_cents / 100:,.2f}")

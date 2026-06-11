@@ -6,6 +6,7 @@ import pytest
 
 from kalshi_temp_bot.strategy import (
     MarketView,
+    has_liquidity,
     idle_watch_summary,
     parse_time,
     pick_best_candidate,
@@ -14,6 +15,25 @@ from kalshi_temp_bot.strategy import (
     select_buy_candidates,
     volume_qualifying_markets,
 )
+
+
+def test_has_liquidity_excludes_rails():
+    for ask, expected in [(0, False), (1, False), (2, True), (50, True),
+                          (98, True), (99, False), (100, False), (None, False)]:
+        assert has_liquidity(mk("X", yes_ask=ask)) is expected
+
+
+def test_idle_summary_skips_no_liquidity_closest():
+    # The rail-priced 99c market is numerically closest to 90 but has no real
+    # liquidity, so the non-rail 70c market should be reported instead.
+    markets = [
+        mk("RAIL", volume=300, yes_ask=99),   # closest by |ask-90| but a settled rail
+        mk("LIQUID", volume=300, yes_ask=70),  # real liquidity, further from 90
+    ]
+    summary = idle_watch_summary(
+        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+    assert "closest qualifying LIQUID ask 70c" in summary
+    assert "RAIL" not in summary
 
 NOW = datetime(2026, 6, 8, 12, 0, 0, tzinfo=timezone.utc)
 

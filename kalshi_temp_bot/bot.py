@@ -1,26 +1,29 @@
-"""The daily-temperature trading bot: a small state machine.
+"""The daily-temperature trading bot.
 
-States
-------
-IDLE     no position / no orders -- scanning for a buy candidate
+Manages up to ``max_positions`` concurrent YES positions. Each position runs its
+own small lifecycle:
+
 BUYING   a YES buy (limit @ 90c) is working -- waiting for fill(s)
 HOLDING  contracts held with a resting YES sell (limit @ 99c) working
-EXITING  a forced close-out (aggressive sell before market close) is working
+EXITING  a forced close-out (aggressive sell) is working
 
-Invariants
-----------
-* Only one trade is ever in flight (enforced by only entering from IDLE).
-* No position is carried through market close: as a market nears its close time
-  the held position is force-sold regardless of price.
+Exit rules, per position:
+* take-profit -- the resting sell at 99c fills; or
+* stop-loss   -- the YES bid falls to/below ``min_sell_price_cents`` (if > 0); or
+* close       -- never carry a position through market close: force-sell
+                 ``force_sell_buffer_seconds`` before it.
+
+A position whose market currently has no exit liquidity (no YES bid) does NOT
+count against ``max_positions``, so a stuck position can't block new trades.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from . import money
 from .config import Config
@@ -43,11 +46,24 @@ logger = logging.getLogger(__name__)
 SERIES_REQUEST_SPACING = 0.15
 
 
-class State(Enum):
-    IDLE = "idle"
+class TradeState(Enum):
     BUYING = "buying"
     HOLDING = "holding"
     EXITING = "exiting"
+
+
+@dataclass
+class Trade:
+    """A single position and its in-flight orders."""
+
+    ticker: str
+    count: int
+    buy_price: Optional[int]
+    state: TradeState = TradeState.BUYING
+    buy_order: Optional[dict] = None
+    sell_order: Optional[dict] = None
+    exit_order: Optional[dict] = None
+    buy_placed_at: float = 0.0
 
 
 class TradingBot:
@@ -63,12 +79,7 @@ class TradingBot:
         self.cache = cache
         self.ws = ws
 
-        self.state = State.IDLE
-        self.position: Optional[dict] = None  # {ticker, count, buy_price}
-        self.buy_order: Optional[dict] = None
-        self.sell_order: Optional[dict] = None
-        self.exit_order: Optional[dict] = None
-        self._buy_placed_at: float = 0.0
+        self.trades: List[Trade] = []
 
         self._market_cache: List[MarketView] = []
         self._last_scan: float = 0.0
@@ -81,8 +92,8 @@ class TradingBot:
         self._running = True
         mode = "DRY-RUN (paper)" if self.cfg.dry_run else "LIVE"
         logger.info(
-            "Starting bot | env=%s | mode=%s | series=%s",
-            self.cfg.env, mode, ",".join(self.cfg.temperature_series),
+            "Starting bot | env=%s | mode=%s | max_positions=%d | series=%s",
+            self.cfg.env, mode, self.cfg.max_positions, ",".join(self.cfg.temperature_series),
         )
         if self.ws is not None:
             self.ws.start()
@@ -108,14 +119,10 @@ class TradingBot:
     def tick(self) -> None:
         markets = self._get_markets()
         self._maybe_heartbeat(markets)
-        if self.state is State.IDLE:
-            self._try_enter(markets)
-        elif self.state is State.BUYING:
-            self._check_buy(markets)
-        elif self.state is State.HOLDING:
-            self._manage_holding(markets)
-        elif self.state is State.EXITING:
-            self._check_exit()
+        # Advance each open position; drop the ones that have gone flat.
+        self.trades = [t for t in self.trades if not self._manage_trade(t, markets)]
+        # Open new positions while we have free slots.
+        self._maybe_enter(markets)
 
     # -- heartbeat ---------------------------------------------------------
     def _maybe_heartbeat(self, markets: List[MarketView]) -> None:
@@ -133,26 +140,24 @@ class TradingBot:
             logger.debug("heartbeat formatting failed", exc_info=True)
 
     def _heartbeat_message(self, markets: List[MarketView]) -> str:
-        if self.state is State.HOLDING and self.position:
-            market = self._market_for(markets, self.position["ticker"])
-            bid = market.yes_bid if market else None
-            stc = seconds_to_close(market) if market else None
-            closes = f"; closes in {int(stc // 60)}m" if stc is not None else ""
-            bid_txt = f"{bid}c" if bid is not None else "?"
-            return (f"holding {self.position['ticker']} x{self.position['count']} | "
-                    f"sell target {self.cfg.sell_yes_price_cents}c, bid {bid_txt}{closes}")
-        if self.state is State.BUYING and self.position:
-            return (f"buying {self.position['ticker']} x{self.position['count']} "
-                    f"@ {self.cfg.buy_yes_price_cents}c -- awaiting fill")
-        if self.state is State.EXITING and self.position:
-            return f"force-exiting {self.position['ticker']} -- flattening before close"
-        return idle_watch_summary(
+        watch = idle_watch_summary(
             markets,
             target_yes_price_cents=self.cfg.buy_yes_price_cents,
             volume_threshold_ratio=self.cfg.volume_threshold_ratio,
             scope=self.cfg.max_volume_scope,
             min_seconds_to_close=self.cfg.min_seconds_to_close,
         )
+        head = f"{self._occupied_slots(markets)}/{self.cfg.max_positions} slots, {len(self.trades)} position(s)"
+        if not self.trades:
+            return f"{watch} | {head}"
+        briefs = []
+        for trade in self.trades[:3]:
+            market = self._market_for(markets, trade.ticker)
+            bid = market.yes_bid if market else None
+            bid_txt = f"{bid}c" if bid is not None else "?"
+            briefs.append(f"{trade.ticker} x{trade.count} {trade.state.value} bid {bid_txt}")
+        more = f" +{len(self.trades) - 3} more" if len(self.trades) > 3 else ""
+        return f"{watch} | {head} [{'; '.join(briefs)}{more}]"
 
     # -- market data -------------------------------------------------------
     def _get_markets(self) -> List[MarketView]:
@@ -224,15 +229,22 @@ class TradingBot:
         """Used by the WebSocket layer to know what to subscribe to."""
         return list(self._current_tickers)
 
-    # -- IDLE: look for an entry ------------------------------------------
-    def _try_enter(self, markets: List[MarketView]) -> None:
-        candidates = select_buy_candidates(
-            markets,
-            target_yes_price_cents=self.cfg.buy_yes_price_cents,
-            volume_threshold_ratio=self.cfg.volume_threshold_ratio,
-            scope=self.cfg.max_volume_scope,
-            min_seconds_to_close=self.cfg.min_seconds_to_close,
-        )
+    # -- entry -------------------------------------------------------------
+    def _maybe_enter(self, markets: List[MarketView]) -> None:
+        if self._occupied_slots(markets) >= self.cfg.max_positions:
+            return
+        held = {t.ticker for t in self.trades}
+        candidates = [
+            c
+            for c in select_buy_candidates(
+                markets,
+                target_yes_price_cents=self.cfg.buy_yes_price_cents,
+                volume_threshold_ratio=self.cfg.volume_threshold_ratio,
+                scope=self.cfg.max_volume_scope,
+                min_seconds_to_close=self.cfg.min_seconds_to_close,
+            )
+            if c.ticker not in held  # never double-up on the same market
+        ]
         best = pick_best_candidate(candidates)
         if best is None:
             return
@@ -245,133 +257,161 @@ class TradingBot:
                 best.ticker, balance, self.cfg.buy_yes_price_cents,
             )
             return
+        self._open_trade(best, count, balance)
 
+    def _open_trade(self, market: MarketView, count: int, balance: int) -> None:
         logger.info(
-            "ENTER %s | volume=%.0f | buying %d YES @ %dc (1/3 of %s c)",
-            best.ticker, best.volume, count, self.cfg.buy_yes_price_cents, balance,
+            "ENTER %s | vol=%.0f | buying %d YES @ %dc (sizing from %s c balance)",
+            market.ticker, market.volume, count, self.cfg.buy_yes_price_cents, balance,
         )
-        self.position = {"ticker": best.ticker, "count": count, "buy_price": self.cfg.buy_yes_price_cents}
+        trade = Trade(ticker=market.ticker, count=count, buy_price=self.cfg.buy_yes_price_cents)
 
         if self.cfg.dry_run:
-            # Paper trade: assume the resting bid at 90c fills.
-            logger.info("[PAPER] filled buy %d %s @ %dc", count, best.ticker, self.cfg.buy_yes_price_cents)
-            self._enter_holding()
-            return
-
-        self.buy_order = self.client.create_order(
-            ticker=best.ticker,
-            is_buy=True,
-            count=count,
-            price_cents=self.cfg.buy_yes_price_cents,
-            time_in_force="good_till_canceled",
-        )
-        self._buy_placed_at = time.time()
-        self.state = State.BUYING
-
-    # -- BUYING: wait for fill --------------------------------------------
-    def _check_buy(self, markets: List[MarketView]) -> None:
-        ticker = self.position["ticker"]
-        held = int(self.client.get_position_contracts(ticker))
-        timed_out = (time.time() - self._buy_placed_at) >= self.cfg.buy_timeout_seconds
-
-        if held >= 1 and timed_out:
-            # Lock in whatever filled and stop trying to acquire more.
-            self._cancel(self.buy_order)
-            self.buy_order = None
-            self.position["count"] = held
-            logger.info("Buy filled %d %s; entering HOLDING", held, ticker)
-            self._enter_holding()
-        elif held >= self.position["count"]:
-            self.buy_order = None
-            logger.info("Buy fully filled %d %s; entering HOLDING", held, ticker)
-            self._enter_holding()
-        elif timed_out:
-            # No fills within the window -- abandon the entry and re-scan.
-            logger.info("Buy for %s did not fill within %ss; cancelling", ticker, self.cfg.buy_timeout_seconds)
-            self._cancel(self.buy_order)
-            self._reset_to_idle()
-
-    def _enter_holding(self) -> None:
-        ticker = self.position["ticker"]
-        count = self.position["count"]
-        if self.cfg.dry_run:
-            logger.info("[PAPER] resting SELL %d %s @ %dc", count, ticker, self.cfg.sell_yes_price_cents)
-            self.sell_order = {"order_id": "paper", "status": "resting"}
+            logger.info("[PAPER] filled buy %d %s @ %dc", count, market.ticker, self.cfg.buy_yes_price_cents)
+            self._begin_holding(trade)
         else:
-            self.sell_order = self.client.create_order(
-                ticker=ticker,
-                is_buy=False,
+            trade.buy_order = self.client.create_order(
+                ticker=market.ticker,
+                is_buy=True,
                 count=count,
+                price_cents=self.cfg.buy_yes_price_cents,
+                time_in_force="good_till_canceled",
+            )
+            trade.buy_placed_at = time.time()
+            trade.state = TradeState.BUYING
+        self.trades.append(trade)
+
+    def _begin_holding(self, trade: Trade) -> None:
+        if self.cfg.dry_run:
+            logger.info("[PAPER] resting SELL %d %s @ %dc", trade.count, trade.ticker, self.cfg.sell_yes_price_cents)
+            trade.sell_order = {"order_id": "paper", "status": "resting"}
+        else:
+            trade.sell_order = self.client.create_order(
+                ticker=trade.ticker,
+                is_buy=False,
+                count=trade.count,
                 price_cents=self.cfg.sell_yes_price_cents,
                 time_in_force="good_till_canceled",
             )
-            logger.info("Resting sell placed for %d %s @ %dc", count, ticker, self.cfg.sell_yes_price_cents)
-        self.state = State.HOLDING
+            logger.info("Resting sell placed for %d %s @ %dc", trade.count, trade.ticker, self.cfg.sell_yes_price_cents)
+        trade.state = TradeState.HOLDING
 
-    # -- HOLDING: wait for 99c, or force-sell before close ----------------
-    def _manage_holding(self, markets: List[MarketView]) -> None:
-        ticker = self.position["ticker"]
-        market = self._market_for(markets, ticker)
+    # -- per-position management ------------------------------------------
+    def _manage_trade(self, trade: Trade, markets: List[MarketView]) -> bool:
+        """Advance one position. Returns True when it is finished (flat) and
+        should be dropped from the active list."""
+        if trade.state is TradeState.BUYING:
+            return self._trade_check_buy(trade)
+        if trade.state is TradeState.HOLDING:
+            return self._trade_manage_holding(trade, markets)
+        if trade.state is TradeState.EXITING:
+            return self._trade_check_exit(trade)
+        return False
+
+    def _trade_check_buy(self, trade: Trade) -> bool:
+        held = int(self.client.get_position_contracts(trade.ticker))
+        timed_out = (time.time() - trade.buy_placed_at) >= self.cfg.buy_timeout_seconds
+
+        if held >= trade.count:
+            trade.buy_order = None
+            logger.info("Buy fully filled %d %s; entering HOLDING", held, trade.ticker)
+            self._begin_holding(trade)
+            return False
+        if held >= 1 and timed_out:
+            # Lock in whatever filled and stop trying to acquire more.
+            self._cancel(trade.buy_order)
+            trade.buy_order = None
+            trade.count = held
+            logger.info("Buy filled %d %s; entering HOLDING", held, trade.ticker)
+            self._begin_holding(trade)
+            return False
+        if timed_out:
+            logger.info("Buy for %s did not fill within %ss; cancelling", trade.ticker, self.cfg.buy_timeout_seconds)
+            self._cancel(trade.buy_order)
+            return True
+        return False
+
+    def _trade_manage_holding(self, trade: Trade, markets: List[MarketView]) -> bool:
+        market = self._market_for(markets, trade.ticker)
 
         # 1) Hard deadline: never carry a position through market close.
         stc = seconds_to_close(market) if market else None
         if stc is not None and stc <= self.cfg.force_sell_buffer_seconds:
-            logger.info("%s closes in %.0fs -- force-selling regardless of price", ticker, stc)
-            self._force_sell()
-            return
-        if stc is None and market is None:
-            # Market dropped out of the open set (likely closed). Force-exit.
-            logger.warning("%s no longer open -- force-selling to flatten", ticker)
-            self._force_sell()
-            return
+            logger.info("%s closes in %.0fs -- force-selling regardless of price", trade.ticker, stc)
+            return self._force_exit(trade, "close")
+        if market is None:
+            logger.warning("%s no longer open -- force-selling to flatten", trade.ticker)
+            return self._force_exit(trade, "closed")
 
-        # 2) Normal exit: the resting 99c sell does the work in live mode.
-        if self.cfg.dry_run:
-            if market and market.yes_bid is not None and market.yes_bid >= self.cfg.sell_yes_price_cents:
-                logger.info("[PAPER] sell filled %s @ %dc -- trade complete", ticker, market.yes_bid)
-                self._reset_to_idle()
-            return
-
-        if int(self.client.get_position_contracts(ticker)) <= 0:
-            logger.info("Position %s closed at target %dc -- trade complete", ticker, self.cfg.sell_yes_price_cents)
-            self._reset_to_idle()
-
-    def _force_sell(self) -> None:
-        ticker = self.position["ticker"]
-        count = self.position["count"]
-        # Cancel the resting 99c sell first so it doesn't compete with the exit.
-        self._cancel(self.sell_order)
-        self.sell_order = None
-
-        if self.cfg.dry_run:
-            logger.info("[PAPER] force-sold %d %s at market -- trade complete", count, ticker)
-            self._reset_to_idle()
-            return
-
-        # Aggressive sell that sweeps all resting bids, guaranteeing we exit
-        # whatever liquidity exists before the close (market order semantics).
-        self.exit_order = self.client.create_order(
-            ticker=ticker,
-            is_buy=False,
-            count=count,
-            market_order=True,
-        )
-        logger.info("Force-sell submitted for %d %s", count, ticker)
-        self.state = State.EXITING
-
-    # -- EXITING: confirm we're flat --------------------------------------
-    def _check_exit(self) -> None:
-        ticker = self.position["ticker"]
-        held = int(self.client.get_position_contracts(ticker))
-        if held <= 0:
-            logger.info("Force-sell complete; %s flat", ticker)
-            self._reset_to_idle()
-        else:
-            # Some size couldn't be sold (thin book). Re-sweep aggressively.
-            logger.warning("%s still holds %d after force-sell; re-sweeping", ticker, held)
-            self.exit_order = self.client.create_order(
-                ticker=ticker, is_buy=False, count=held, market_order=True,
+        # 2) Stop-loss: sell once the bid falls to/below the floor (if enabled).
+        if (
+            self.cfg.min_sell_price_cents > 0
+            and market.yes_bid is not None
+            and market.yes_bid <= self.cfg.min_sell_price_cents
+        ):
+            logger.info(
+                "%s bid %dc <= stop %dc -- selling (stop-loss)",
+                trade.ticker, market.yes_bid, self.cfg.min_sell_price_cents,
             )
+            return self._force_exit(trade, "stop-loss")
+
+        # 3) Take-profit: the resting 99c sell does the work in live mode.
+        if self.cfg.dry_run:
+            if market.yes_bid is not None and market.yes_bid >= self.cfg.sell_yes_price_cents:
+                logger.info("[PAPER] sell filled %s @ %dc -- position closed", trade.ticker, market.yes_bid)
+                return True
+            return False
+        if int(self.client.get_position_contracts(trade.ticker)) <= 0:
+            logger.info("Position %s closed at target %dc", trade.ticker, self.cfg.sell_yes_price_cents)
+            return True
+        return False
+
+    def _force_exit(self, trade: Trade, reason: str) -> bool:
+        # Cancel the resting take-profit sell first so it doesn't compete.
+        self._cancel(trade.sell_order)
+        trade.sell_order = None
+
+        if self.cfg.dry_run:
+            logger.info("[PAPER] %s sold at market (%s) -- position closed", trade.ticker, reason)
+            return True
+
+        # Aggressive sell that sweeps all resting bids (market-order semantics).
+        trade.exit_order = self.client.create_order(
+            ticker=trade.ticker, is_buy=False, count=trade.count, market_order=True,
+        )
+        logger.info("Force-sell submitted for %d %s (%s)", trade.count, trade.ticker, reason)
+        trade.state = TradeState.EXITING
+        return False
+
+    def _trade_check_exit(self, trade: Trade) -> bool:
+        held = int(self.client.get_position_contracts(trade.ticker))
+        if held <= 0:
+            logger.info("Force-sell complete; %s flat", trade.ticker)
+            return True
+        # Some size couldn't be sold (thin book). Re-sweep aggressively.
+        logger.warning("%s still holds %d after force-sell; re-sweeping", trade.ticker, held)
+        trade.exit_order = self.client.create_order(
+            ticker=trade.ticker, is_buy=False, count=held, market_order=True,
+        )
+        return False
+
+    # -- slots / liquidity -------------------------------------------------
+    def _occupied_slots(self, markets: List[MarketView]) -> int:
+        """How many positions count against ``max_positions``.
+
+        A HOLDING/EXITING position whose market has no exit liquidity (no YES bid
+        to sell into) is excluded, so a stuck position can't block new trades.
+        """
+        slots = 0
+        for trade in self.trades:
+            if trade.state in (TradeState.HOLDING, TradeState.EXITING) and not self._has_exit_liquidity(trade, markets):
+                continue
+            slots += 1
+        return slots
+
+    def _has_exit_liquidity(self, trade: Trade, markets: List[MarketView]) -> bool:
+        market = self._market_for(markets, trade.ticker)
+        return market is not None and market.yes_bid is not None and market.yes_bid > 0
 
     # -- helpers -----------------------------------------------------------
     def _budget_balance_cents(self) -> int:
@@ -401,22 +441,14 @@ class TradingBot:
         except Exception as exc:
             logger.warning("Cancel of order %s failed: %s", order_id, exc)
 
-    def _reset_to_idle(self) -> None:
-        self.position = None
-        self.buy_order = None
-        self.sell_order = None
-        self.exit_order = None
-        self._buy_placed_at = 0.0
-        self.state = State.IDLE
-
     def _reconcile_existing_positions(self) -> None:
-        """Adopt a pre-existing YES position on startup so the one-trade rule and
-        the no-position-through-close rule hold across restarts."""
+        """Adopt pre-existing YES positions on startup so the no-position-through-
+        close rule holds across restarts."""
         for pos in self.client.get_positions():
             count = int(money.position_contracts(pos))
             if count > 0:
                 ticker = pos.get("ticker", "")
                 logger.info("Adopting existing position %s x%d; resuming HOLDING", ticker, count)
-                self.position = {"ticker": ticker, "count": count, "buy_price": None}
-                self._enter_holding()
-                return
+                trade = Trade(ticker=ticker, count=count, buy_price=None)
+                self._begin_holding(trade)
+                self.trades.append(trade)
