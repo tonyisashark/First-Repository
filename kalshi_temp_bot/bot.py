@@ -154,6 +154,10 @@ class TradingBot:
         self._book_polled_at: Dict[str, float] = {}
         # Forced-exit timestamps per ticker, for the re-entry cooldown.
         self._exited_at: Dict[str, float] = {}
+        # Book-fetch outcome counters since the last heartbeat, so a zero-
+        # estimate state explains itself ("all books one-sided" vs "fetches
+        # failing" need opposite responses).
+        self._book_stats = {"ok": 0, "unusable": 0, "failed": 0}
 
     # -- lifecycle ---------------------------------------------------------
     def run(self) -> None:
@@ -208,11 +212,21 @@ class TradingBot:
             logger.debug("heartbeat formatting failed", exc_info=True)
 
     def _heartbeat_message(self, markets: List[MarketView]) -> str:
+        estimates = self._estimates(markets)
         watch = idle_watch_summary(
             markets,
-            estimates=self._estimates(markets),
+            estimates=estimates,
             portfolio_fraction=self.cfg.portfolio_fraction,
         )
+        if markets and not estimates:
+            # Zero estimates should explain itself: fetches failing and books
+            # being one-sided overnight call for opposite responses.
+            stats = self._book_stats
+            watch += (
+                f" [books since last heartbeat: {stats['ok']} usable, "
+                f"{stats['unusable']} one-sided/wide, {stats['failed']} failed]"
+            )
+        self._book_stats = {"ok": 0, "unusable": 0, "failed": 0}
         head = f"{self._occupied_slots(markets)}/{self.cfg.max_positions} slots, {len(self.trades)} position(s)"
         if not self.trades:
             return f"{watch} | {head}"
@@ -316,11 +330,15 @@ class TradingBot:
         """Fold one fetched order book into the per-ticker EWMA estimate."""
         self._book_cache[ticker] = (summary, now)
         bid, ask = summary["bid"], summary["ask"]
-        if bid is None or ask is None or (ask - bid) > MAX_INFORMATIVE_SPREAD_CENTS:
-            return  # one-sided or uninformative book: let the estimate go stale
+        if bid is None or ask is None or not (0 <= ask - bid <= MAX_INFORMATIVE_SPREAD_CENTS):
+            # One-sided, crossed or uninformative book: let the estimate go stale.
+            self._book_stats["unusable"] += 1
+            return
         micro = microprice_cents(bid, ask, summary["bid_eff"], summary["ask_eff"])
         if micro is None:
+            self._book_stats["unusable"] += 1
             return
+        self._book_stats["ok"] += 1
         previous = self._micro_ewma.get(ticker)
         if previous is None or self.ewma_half_life <= 0:
             value = micro
@@ -340,6 +358,7 @@ class TradingBot:
             summary = money.orderbook_summary(get_orderbook(ticker), LEVEL_DECAY_CENTS)
         except Exception as exc:
             logger.warning("Orderbook fetch for %s failed: %s", ticker, exc)
+            self._book_stats["failed"] += 1
             return None
         self._note_book(ticker, summary, now)
         return summary

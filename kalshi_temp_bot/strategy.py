@@ -143,9 +143,13 @@ def spread_cents(market: MarketView) -> Optional[int]:
 
 
 def informative(market: MarketView) -> bool:
-    """True when the book is tight enough to carry probability information."""
+    """True when the book is tight enough to carry probability information.
+
+    A *crossed* view (bid above ask) is data skew -- e.g. one side updated by
+    the realtime feed while the other is a stale scan -- not information.
+    """
     spread = spread_cents(market)
-    return spread is not None and spread <= MAX_INFORMATIVE_SPREAD_CENTS
+    return spread is not None and 0 <= spread <= MAX_INFORMATIVE_SPREAD_CENTS
 
 
 def microprice_cents(

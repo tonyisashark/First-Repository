@@ -54,6 +54,7 @@ def test_spread_counts_one_sided_books_as_wide():
     assert spread_cents(mk("X")) is None
     assert informative(mk("X", yes_bid=80, yes_ask=99)) is True   # spread 19 <= 20
     assert informative(mk("X", yes_bid=70, yes_ask=99)) is False  # spread 29 > 20
+    assert informative(mk("X", yes_bid=64, yes_ask=60)) is False  # crossed: data skew
 
 
 def test_microprice_weights_toward_the_pressured_side():
