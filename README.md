@@ -9,9 +9,13 @@ there are no strategy knobs to configure.
   (microprice: resting pressure near the touch pulls the estimate toward the
   opposite quote, deeper levels count at exponentially decaying weight),
   EWMA-smoothed over time, then **renormalized across the event's buckets** —
-  mutually exclusive temperature ranges must sum to 100%, so dividing by the
-  event's actual sum strips the structural overround / longshot bias. Books
-  too wide to mean anything produce no estimate at all.
+  mutually exclusive temperature ranges must sum to exactly 100%, and the
+  correction is *arbitrage-grounded*: estimates scale down only when the
+  event's bids sum above 100¢ (selling every bucket would lock a profit) and
+  up only when its asks sum below 100¢, so stale minimum-tick quotes in dead
+  events can't fabricate edges. Rail-priced buckets (≤3¢/≥97¢) are pinned —
+  they're settlement certainty, not opinion. Books too wide to mean anything
+  produce no estimate at all.
 - **Entry:** every market is priced on both sides as a taker (YES at the ask,
   NO at `100 − bid`), **including Kalshi's taker fee**. Sides with at least
   **+2¢ net edge** (estimate vs all-in cost) are ranked by **expected
@@ -59,10 +63,13 @@ there are no strategy knobs to configure.
 
 **Why renormalization is the edge:** each temperature event's buckets are
 mutually exclusive and exhaustive, so their true probabilities sum to exactly
-100%. Quoted books usually sum to more (overround) — and not uniformly: thin
-favorites/longshots are mispriced most. Renormalizing the microprice across
-the event recovers a calibrated probability and exposes which *individual
-buckets* are over- or under-priced — on either side.
+100%. When the event's resting *bids* sum above 100¢, or its *asks* below,
+real money is provably mispriced — and not uniformly across buckets.
+Rescaling the microprice by that proven deviation recovers a calibrated
+probability and exposes which individual buckets are over- or under-priced —
+on either side. Grounding the correction in actual bids/asks (rather than
+mid-sums) means stale 1¢/3¢ quotes left in settled events can't fabricate
+phantom edges.
 
 **Why expected log-growth (not raw edge) ranks trades:** a 2¢ edge on a 20¢
 contract is far more valuable per dollar than a 2¢ edge on a 94¢ contract, but

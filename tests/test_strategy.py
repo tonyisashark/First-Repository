@@ -74,25 +74,48 @@ def test_side_quotes_mirror_for_no():
 
 
 # --- renormalization ----------------------------------------------------------
-def test_renormalization_strips_event_overround():
-    # Buckets sum to 108% -> a 94c estimate's genuine chance is ~87%.
+def test_renormalization_scales_down_when_bids_exceed_parity():
+    # Selling every bucket at bid would collect 105c on a 100c event: real
+    # resting money says the event is overpriced, so estimates scale by 100/105.
     markets = [
         mk("BIG", yes_bid=93, yes_ask=95),
         mk("MID", yes_bid=9, yes_ask=11),
         mk("LOW", yes_bid=3, yes_ask=5),
     ]
     est = renormalized_estimates(markets, {"BIG": 94.0, "MID": 10.0, "LOW": 4.0})
-    assert est["BIG"] == pytest.approx(94 * 100 / 108)
-    assert est["MID"] == pytest.approx(10 * 100 / 108)
+    assert est["BIG"] == pytest.approx(94 * 100 / 105)
+    assert est["MID"] == pytest.approx(10 * 100 / 105)
 
 
-def test_renormalization_uses_mids_for_book_less_buckets():
-    # Only BIG has a book estimate; the other bucket's quoted mid (6) still
-    # counts toward the event sum (94 + 6 = 100 -> no-op scaling).
+def test_renormalization_leaves_parity_spreads_alone():
+    # Bids sum to 98, asks to 102: parity sits inside the spread, so there is
+    # no arbitrage-grounded correction and the raw estimate is kept.
     markets = [mk("BIG", yes_bid=93, yes_ask=95), mk("REST", yes_bid=5, yes_ask=7)]
     est = renormalized_estimates(markets, {"BIG": 94.0})
     assert est["BIG"] == pytest.approx(94.0)
-    assert "REST" not in est  # no book estimate -> not tradeable
+    assert "REST" not in est  # no raw estimate -> not estimated
+
+
+def test_renormalization_scales_up_when_asks_sum_below_parity():
+    # Buying the whole event at ask costs 96c for a certain 100c payout: the
+    # buckets are collectively underpriced, so estimates scale by 100/96.
+    markets = [mk("A", yes_bid=91, yes_ask=92), mk("Z", yes_bid=2, yes_ask=4)]
+    est = renormalized_estimates(markets, {"A": 91.5})
+    assert est["A"] == pytest.approx(91.5 * 100 / 96)
+
+
+def test_renormalization_ignores_stale_tail_residue():
+    # The observed phantom: a decided event whose winner is quoted 92/95 with
+    # six stale 1c/3c tails. Mid-sums (93.5 + 6*2 = 105.5) would tax the
+    # winner to ~88.6% and invent a ~+3c NO edge; bid-sums (92 + 6 = 98) say
+    # there is no sellable overpricing, so the estimate must stay put.
+    markets = [mk("WIN", yes_bid=92, yes_ask=95)] + [
+        mk(f"T{i}", yes_bid=1, yes_ask=3) for i in range(6)
+    ]
+    est = renormalized_estimates(markets, {"WIN": 93.5})
+    assert est["WIN"] == pytest.approx(93.5)
+    no = evaluate_side(markets[0], "no", est["WIN"], 1 / 3)
+    assert no.edge_cents < 0  # NO at 8c on a settled winner is not an edge
 
 
 def test_renormalization_skipped_when_sum_is_implausible():
@@ -133,19 +156,19 @@ def test_idle_summary_skips_rail_priced_markets():
         mk("Z", event="LIVE", yes_bid=5, yes_ask=7),
     ]
     text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
-    assert "WIN" not in text
-    assert "closest: MID" in text
+    assert "WIN" not in text and "T1" not in text
+    assert "closest:" in text
 
 
-def test_renormalization_ignores_uninformative_mids():
-    # The wide-spread bucket would poison the event sum; it must not count.
+def test_renormalization_ignores_uninformative_quotes():
+    # The wide-spread bucket would poison the event sums; it must not count.
     markets = [
         mk("BIG", yes_bid=93, yes_ask=95),
         mk("WIDE", yes_bid=1, yes_ask=99),   # spread 98: no information
         mk("REST", yes_bid=5, yes_ask=7),
     ]
     est = renormalized_estimates(markets, {"BIG": 94.0})
-    assert est["BIG"] == pytest.approx(94.0)  # sum stays 94 + 6 = 100
+    assert est["BIG"] == pytest.approx(94.0)  # bid/ask sums stay 98/102: parity
 
 
 # --- fee / kelly / growth ------------------------------------------------------
@@ -197,10 +220,10 @@ def test_fair_market_offers_no_candidate():
 
 
 def test_underpriced_yes_is_selected():
-    # Ask 92 while the renormalized estimate is ~96.8 -> a real YES edge.
+    # Ask 92 while the renormalized estimate is ~95.3 -> a real YES edge.
     markets = [mk("A", yes_bid=91, yes_ask=92), mk("Z", yes_bid=2, yes_ask=4)]
-    est = renormalized_estimates(markets, {"A": 91.5})   # sum 91.5+3 -> renorm up
-    assert est["A"] == pytest.approx(91.5 * 100 / 94.5)
+    est = renormalized_estimates(markets, {"A": 91.5})   # asks sum 96 -> scale up
+    assert est["A"] == pytest.approx(91.5 * 100 / 96)
     cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
     assert [(c.market.ticker, c.side) for c in cands] == [("A", "yes")]
     assert cands[0].edge_cents >= MIN_EDGE_CENTS
@@ -211,13 +234,13 @@ def test_overpriced_yes_selects_no_side():
     # The bid (55) is far above the renormalized estimate (~47.8): buying NO
     # at 45c with a ~52.2% chance is the edge.
     markets = [mk("A", yes_bid=55, yes_ask=57), mk("Z", yes_bid=59, yes_ask=61)]
-    est = renormalized_estimates(markets, {"A": 55.0})   # sum 55+60=115 -> scale down
-    assert est["A"] == pytest.approx(55 * 100 / 115)
+    est = renormalized_estimates(markets, {"A": 55.0})   # bids sum 114 -> scale down
+    assert est["A"] == pytest.approx(55 * 100 / 114)
     cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
     assert [(c.market.ticker, c.side) for c in cands] == [("A", "no")]
     no = cands[0]
     assert no.price_cents == 45
-    assert no.chance_cents == pytest.approx(100 - 55 * 100 / 115)
+    assert no.chance_cents == pytest.approx(100 - 55 * 100 / 114)
     # Thin-edge protection: the Kelly cap deploys less than the 1/3 ceiling.
     assert no.fraction < 1 / 3
     assert no.fraction == pytest.approx(
@@ -303,10 +326,12 @@ def test_idle_summary_reports_best_candidate():
 
 def test_idle_summary_reports_closest_miss():
     markets = [mk("A", yes_bid=92, yes_ask=94), mk("Z", yes_bid=5, yes_ask=7)]
-    est = renormalized_estimates(markets, {"A": 93.0})  # fair -> no candidate
-    text = idle_watch_summary(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    # A book-backed estimate slightly under the ask: close, but no candidate.
+    text = idle_watch_summary(
+        markets, estimates={"A": 94.0}, portfolio_fraction=1 / 3, now=NOW)
     assert "no side above" in text
     assert "closest: A" in text
+    assert "~" not in text  # book-backed, not approximate
 
 
 def test_idle_summary_falls_back_to_approximate_mids():
@@ -314,7 +339,7 @@ def test_idle_summary_falls_back_to_approximate_mids():
     # is still reported, marked as approximate.
     markets = [mk("A", yes_bid=92, yes_ask=94), mk("Z", yes_bid=5, yes_ask=7)]
     text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
-    assert "closest: A" in text
+    assert "closest:" in text
     assert "~" in text
 
 

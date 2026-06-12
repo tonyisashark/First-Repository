@@ -53,15 +53,15 @@ def mv(ticker, *, event="E", yes_bid=91, yes_ask=92, volume=1000, close_in_s=5 *
 
 
 def filler(event="E", ticker=None):
-    # A complementary low bucket so the event's estimates sum to slightly less
-    # than 100 (91.5 + 3): renormalization lifts the big bucket's estimate to
-    # ~96.8%, well above its 92c ask -> a genuine YES edge.
+    # A complementary low bucket so the event's asks sum to 96 (< 100: buying
+    # the whole event at ask beats its certain payout): renormalization lifts
+    # the big bucket's estimate to ~95.4%, above its 92c ask -> a YES edge.
     return mv(ticker or f"ZF_{event}", event=event, yes_bid=2, yes_ask=4, volume=1)
 
 
 def edge_book():
     # Matches mv() defaults: bid 91 (500 deep), ask 92 (400 deep) -> microprice
-    # ~91.56; with the filler the renormalized estimate is ~96.8%.
+    # ~91.56; with the filler the renormalized estimate is ~95.4%.
     return {"yes": [[91, 500]], "no": [[8, 400]]}
 
 
@@ -111,8 +111,14 @@ def test_enters_no_side_when_yes_is_overpriced():
     trade = bot.trades[0]
     assert (trade.ticker, trade.side) == ("A", "no")
     assert trade.buy_price == 45          # NO ask = 100 - yes_bid
-    # Thin edge -> the Kelly cap (~9.4%), not the 1/3 ceiling, sizes the trade.
-    assert 62 <= trade.count < 63
+    # Thin edge -> the Kelly cap (~7.8%), not the 1/3 ceiling, sizes the trade:
+    # est = 56 * 100/114 (bid-sum renorm), p_no = 100 - est, cost = 45 + fee.
+    from kalshi_temp_bot.strategy import kelly_fraction, taker_fee_cents
+    p_no = 100 - 56 * 100 / 114
+    kelly = kelly_fraction(p_no, 45 + taker_fee_cents(45))
+    assert kelly < 1 / 3
+    expected = int((300_00 * kelly / 45) * 100) / 100
+    assert trade.count == pytest.approx(expected, abs=0.01)
     assert trade.count == round(trade.count, 2)  # 0.01-contract granularity
 
 
@@ -200,9 +206,9 @@ def test_edge_reversal_exit_cashes_out_an_overpriced_bid():
     bot.tick()
     assert bot.trades[0].state is TradeState.HOLDING
 
-    # The market re-prices: bid 80/ask 82, but the event now sums to 109 so the
-    # renormalized estimate is ~74.3%. Selling at 80c nets ~78.9c -> the bid
-    # overprices our side by ~4.6c (> 3c): cash out.
+    # The market re-prices: bid 80/ask 82, but the event's bids now sum to 107
+    # so the renormalized estimate is ~75.7%. Selling at 80c nets ~78.9c -> the
+    # bid overprices our side by ~3.2c (> 3c): cash out.
     a.yes_bid, a.yes_ask = 80, 82
     z.yes_bid, z.yes_ask = 27, 29
     bot.client.books["A"] = {"yes": [[80, 100_000]], "no": [[18, 100_000]]}

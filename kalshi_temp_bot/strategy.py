@@ -16,8 +16,9 @@ edge -- YES or NO.
    * smooth = EWMA over time (the bot loop owns the state), so one spoofed or
      transient quote cannot move the estimate by itself;
    * renorm = the buckets of one event are mutually exclusive and exhaustive,
-     so their probabilities must sum to 100%; dividing by the event's actual
-     estimate-sum strips the structural overround / longshot bias;
+     so their probabilities must sum to 100%; estimates are rescaled only when
+     the book proves a real deviation (bids summing above 100c or asks below),
+     which strips genuine overround while ignoring stale minimum-tick quotes;
    * gate   = a book wider than ``MAX_INFORMATIVE_SPREAD_CENTS`` carries no
      probability information and produces no estimate at all.
 
@@ -172,28 +173,48 @@ def renormalized_estimates(
 ) -> Dict[str, float]:
     """Final per-ticker probability estimates (cents), renormalized per event.
 
-    ``raw_estimates`` maps ticker -> smoothed microprice for markets where the
-    bot has order-book data. Buckets without one contribute their plain midpoint
-    to the event sum (every bucket must be counted for the sum to mean
-    anything), but only book-backed tickers receive a final estimate.
-    Uninformative (wide-spread) books contribute nothing and get nothing.
+    ``raw_estimates`` maps ticker -> smoothed microprice (or quoted mid) for
+    the markets being estimated; only those tickers receive a final value.
+
+    Renormalization is *arbitrage-grounded*: an event's mutually exclusive
+    buckets must truly sum to 100%, but mid-sums are easily polluted by stale
+    minimum-tick quotes (a dead event's 1c-bid/3c-ask tails add 2c of "mid"
+    each and once manufactured a phantom NO edge on the settled winner). So
+    estimates are scaled DOWN only when the event's BIDS sum above 100c --
+    selling every bucket at bid would lock a profit, i.e. real money says the
+    event is overpriced -- and scaled UP only when its ASKS sum below 100c
+    (buying the whole event at ask would cost less than its certain payout).
+    Anything between is spread-noise around parity and is left alone. The
+    conservative side of the book is used for the factor, so the correction
+    is never larger than what resting orders actually justify.
+
+    Rail-priced values (outside ``RAIL_MIN/MAX_CENTS``) are settlement
+    certainty, not opinion: they are never rescaled. Uninformative
+    (wide-spread) books contribute nothing to the sums and get no estimate.
     """
-    sums: Dict[str, float] = {}
+    bid_sums: Dict[str, float] = {}
+    ask_sums: Dict[str, float] = {}
     for market in markets:
-        value = raw_estimates.get(market.ticker)
-        if value is None:
-            value = mid_price_cents(market) if informative(market) else None
-        if value is not None:
-            sums[market.event_ticker] = sums.get(market.event_ticker, 0.0) + value
+        if not informative(market):
+            continue
+        event = market.event_ticker
+        bid_sums[event] = bid_sums.get(event, 0.0) + (market.yes_bid or 0)
+        ask_sums[event] = ask_sums.get(event, 0.0) + market.yes_ask
 
     final: Dict[str, float] = {}
     for market in markets:
         value = raw_estimates.get(market.ticker)
         if value is None:
             continue
-        total = sums.get(market.event_ticker, 0.0)
-        if RENORM_SUM_MIN <= total <= RENORM_SUM_MAX and RAIL_MIN_CENTS < value < RAIL_MAX_CENTS:
-            value = value * 100.0 / total
+        sum_bid = bid_sums.get(market.event_ticker, 0.0)
+        sum_ask = ask_sums.get(market.event_ticker, 0.0)
+        factor = 1.0
+        if 100.0 < sum_bid <= RENORM_SUM_MAX:
+            factor = 100.0 / sum_bid
+        elif RENORM_SUM_MIN <= sum_ask < 100.0:
+            factor = 100.0 / sum_ask
+        if RAIL_MIN_CENTS < value < RAIL_MAX_CENTS:
+            value *= factor
         final[market.ticker] = min(99.0, max(1.0, value))
     return final
 
