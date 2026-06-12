@@ -166,6 +166,24 @@ def test_maker_entry_times_out_and_is_repriced_next_tick():
     assert bot.trades and bot.trades[0].state is TradeState.BUYING
 
 
+def test_resting_bid_is_pulled_when_the_estimate_collapses():
+    # The book repricing downward through our level would FILL the stale bid
+    # (adverse selection); the estimate seeing the move first must cancel it
+    # before that happens.
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    wide_maker_universe(bot)
+    bot.tick()
+    assert bot.trades and bot.trades[0].buy_price == 41
+
+    # Book pressure flips: microprice drops to ~39.5, below the 41c bid.
+    bot.client.books["A"] = {"yes": [[30, 2000]], "no": [[60, 100]]}
+    bot.tick()                                     # this tick refreshes the book
+    bot.tick()                                     # ... and this one acts on it
+    # The stale YES bid is gone (the freed slot may immediately repost on the
+    # side the new estimate actually favours -- here NO).
+    assert not any(t.side == "yes" for t in bot.trades)
+
+
 def test_taker_edge_preempts_a_resting_maker_bid():
     bot = make_bot(client=FakeBookClient(), max_positions=1)
     a = wide_maker_universe(bot)

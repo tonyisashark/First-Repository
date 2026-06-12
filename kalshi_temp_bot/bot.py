@@ -723,6 +723,25 @@ class TradingBot:
         timeout = self.maker_buy_timeout if trade.maker else self.buy_timeout
         timed_out = (time.time() - trade.buy_placed_at) >= timeout
 
+        # An unfilled bid whose justification has evaporated must not sit in
+        # the book waiting to be picked off by the very move it failed to see:
+        # pull it the moment the estimate no longer covers the price.
+        estimate = self._estimates(markets).get(trade.ticker)
+        if estimate is not None and trade.buy_price is not None:
+            chance = estimate if trade.side == "yes" else 100.0 - estimate
+            if chance <= trade.buy_price:
+                # A partial fill is a real position: let the normal flow lock
+                # it in (the exit rules then deal with it); only an entirely
+                # unfilled order is safe to drop outright.
+                held = 0.0 if self.cfg.dry_run else self._held_for(trade)
+                if held <= 0:
+                    logger.info(
+                        "Cancelling entry %s %s @ %sc: estimate fell to %.1f%%",
+                        trade.ticker, trade.side.upper(), trade.buy_price, chance,
+                    )
+                    self._cancel(trade.buy_order)
+                    return True
+
         if self.cfg.dry_run:
             # Paper maker fill: the market trading down through the resting
             # bid is the only fill observable from quotes alone. This is the
