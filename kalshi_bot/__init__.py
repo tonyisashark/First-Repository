@@ -7,4 +7,4 @@ shared risk layer; nothing trades without passing exposure caps, drawdown
 circuit breakers, and a kill switch.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -86,6 +86,8 @@ class StateStore:
             os.makedirs(directory, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.execute("PRAGMA journal_mode=WAL")
+        # the GUI reads from its own connections while the bot writes
+        self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
 

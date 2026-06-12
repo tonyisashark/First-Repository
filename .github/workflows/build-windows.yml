@@ -1,0 +1,38 @@
+name: build-windows-exe
+
+on:
+  push:
+    branches: [main, master, "claude/**"]
+  workflow_dispatch:
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev] pyinstaller
+      - name: Tests
+        run: pytest -q
+      - name: GUI import smoke test (tkinter present on Windows)
+        run: python -c "import kalshi_bot.gui, kalshi_bot.gui_settings, kalshi_bot.paths; print('gui imports ok')"
+      - name: Generate icon
+        run: python assets/make_icon.py
+      - name: Build KalshiBot.exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed
+          --name KalshiBot --icon assets/icon.ico
+          --collect-submodules kalshi_bot --hidden-import dotenv
+          gui_app.py
+      - name: Show result
+        run: dir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KalshiBot-windows
+          path: dist/KalshiBot.exe
+          if-no-files-found: error

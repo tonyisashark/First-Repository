@@ -96,7 +96,15 @@ def make_bot(tmp_path):
 
 def test_full_cycle_trades_all_strategies(tmp_path):
     bot, state, paper = make_bot(tmp_path)
+    statuses = []
+    bot.status_listener = statuses.append
     view = bot.run_cycle(now=NOW)
+
+    # the GUI status feed fired with a complete, sane payload
+    assert statuses and statuses[-1]["mode"] == "paper"
+    assert statuses[-1]["equity"] > 0
+    assert set(statuses[-1]["used"]) <= {"arb", "longshot", "mm", "unattributed"}
+    assert statuses[-1]["halted"] is False
 
     positions = paper.positions()
     # arb bought all three legs in equal size, capped by the event limit

@@ -10,7 +10,12 @@ automatically scale future positions up and losses scale them down.
 pip install -e .
 cp .env.example .env        # add your API key (demo keys are free)
 kalshi-bot run              # paper mode by default -- watch it trade risk-free
+kalshi-bot gui              # ...or use the desktop control panel
 ```
+
+Prefer an app? Grab **`KalshiBot.exe`** from the latest
+[build-windows-exe workflow artifact](../../actions/workflows/build-windows.yml)
+(or build it yourself with `build_windows.bat`) -- no Python required.
 
 > ⚠️ **This is not a money printer.** Prediction markets are competitive,
 > fees are real, and any strategy can lose -- including all of these. Nothing
@@ -107,7 +112,7 @@ allowed. State survives restarts (SQLite).
 
 ```bash
 pip install -e .          # Python 3.10+
-pytest -q                 # 75 offline tests, no network needed
+pytest -q                 # 84 offline tests, no network needed
 ```
 
 ### 2. Credentials
@@ -141,10 +146,35 @@ KALSHI_ENV=prod DRY_RUN=false LIVE_TRADING_ACK=I_UNDERSTAND_THE_RISKS kalshi-bot
 Climb one rung at a time and let each run for days, not minutes. Compare the
 paper equity curve (`kalshi-bot status`) against what you'd accept live.
 
+### Desktop app (GUI / Windows .exe)
+
+```bash
+kalshi-bot gui            # needs Tk (`apt install python3-tk` on Debian/Ubuntu)
+```
+
+The control panel has a dashboard (Start/Stop, live equity, day P&L,
+drawdown, per-strategy deployment, a 24h equity chart, streaming logs), a
+**Kill switch** / **Resume** pair, and a Settings tab covering credentials,
+the safety switches, strategy budgets and risk limits. Settings, state and
+logs live in a per-user folder (`%APPDATA%\KalshiBot` on Windows,
+`~/.config/kalshi-bot` on Linux, `~/Library/Application Support/KalshiBot`
+on macOS), so the packaged app works from a read-only install location.
+
+**Windows executable**: every push runs the `build-windows-exe` GitHub
+Actions workflow, which tests the code, builds a single-file windowed
+`KalshiBot.exe` with PyInstaller, and uploads it as an artifact -- open the
+latest green run and download `KalshiBot-windows`. To build locally on a
+Windows machine instead, install Python 3.10+ from python.org and run
+`build_windows.bat`; the exe lands in `dist\KalshiBot.exe`. The app starts
+in paper mode and enforces the same triple opt-in before touching real
+money. (Unsigned PyInstaller exes can trip SmartScreen/antivirus
+heuristics -- "More info -> Run anyway", or build it yourself.)
+
 ### Commands
 
 ```
 kalshi-bot run            trading loop (Ctrl-C cancels resting orders and exits)
+kalshi-bot gui            desktop control panel
 kalshi-bot status         equity, halts, recent activity
 kalshi-bot balance        exchange or paper balance + positions
 kalshi-bot markets        top open markets by 24h volume
@@ -221,8 +251,11 @@ kalshi_bot/
   execution.py   one order gateway for live + paper, with final clamps
   strategies/    arbitrage.py, longshot.py, market_maker.py (pure logic, tested)
   bot.py         market cache + reconciliation + main loop
-  cli.py         run / status / scan / calibrate / kill / resume / ...
-tests/           75 offline tests incl. an end-to-end scripted-exchange cycle
+  cli.py         run / gui / status / scan / calibrate / kill / resume / ...
+  gui.py         Tkinter control panel (bot on a worker thread, queues between)
+  gui_settings.py / paths.py   GUI logic with no Tk dependency (tested headless)
+gui_app.py       PyInstaller entry point; build_windows.bat + CI build the exe
+tests/           84 offline tests incl. end-to-end scripted-exchange cycles
 ```
 
 Design choices that matter:

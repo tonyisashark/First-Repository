@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kalshi-bot"
-version = "1.0.0"
+version = "1.1.0"
 description = "Autonomous, risk-managed Kalshi trading bot that compounds a portfolio across multiple strategies"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,6 +20,9 @@ dev = ["pytest>=7.4"]
 
 [project.scripts]
 kalshi-bot = "kalshi_bot.cli:main"
+
+[project.gui-scripts]
+kalshi-bot-gui = "kalshi_bot.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["kalshi_bot*"]

@@ -34,6 +34,7 @@ def main(argv: Optional[list] = None) -> int:
                         help="override KALSHI_ENV for this invocation")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="start the trading loop")
+    sub.add_parser("gui", help="open the desktop control panel")
     sub.add_parser("status", help="show local state summary")
     sub.add_parser("balance", help="show cash balance")
     p_markets = sub.add_parser("markets", help="top open markets by volume")
@@ -57,6 +58,7 @@ def main(argv: Optional[list] = None) -> int:
     command = args.command or "run"
     handler = {
         "run": cmd_run,
+        "gui": cmd_gui,
         "status": cmd_status,
         "balance": cmd_balance,
         "markets": cmd_markets,
@@ -82,6 +84,17 @@ def cmd_run(cfg: Config, _args) -> int:
     bot = build_bot(cfg)
     bot.run_forever()
     return 0
+
+
+def cmd_gui(_cfg: Config, _args) -> int:
+    try:
+        from .gui import main as gui_main
+    except ImportError as exc:
+        print(f"GUI unavailable: {exc}\n"
+              "Install Tk support (e.g. `apt install python3-tk`) or use the "
+              "packaged KalshiBot.exe on Windows.", file=sys.stderr)
+        return 1
+    return gui_main()
 
 
 def cmd_status(cfg: Config, _args) -> int:

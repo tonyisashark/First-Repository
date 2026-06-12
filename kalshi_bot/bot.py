@@ -137,6 +137,12 @@ class TradingBot:
         self._cooldown_until: Dict[str, float] = {}
         self._was_halted = False
         self._stop = False
+        # Optional observer (e.g. the GUI) called with a status dict per cycle.
+        self.status_listener: Optional[callable] = None
+
+    def stop(self) -> None:
+        """Request a graceful stop after the current cycle (thread-safe)."""
+        self._stop = True
 
     # ------------------------------------------------------------------ loop
     def run_forever(self) -> None:
@@ -158,8 +164,13 @@ class TradingBot:
             except Exception:
                 logger.exception("cycle failed unexpectedly")
             elapsed = time.monotonic() - started
-            time.sleep(max(0.5, self.cfg.poll_seconds - elapsed))
+            self._interruptible_sleep(max(0.5, self.cfg.poll_seconds - elapsed))
         self.shutdown()
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while not self._stop and time.monotonic() < deadline:
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
     def run_cycle(self, now: Optional[int] = None) -> PortfolioView:
         now = int(now if now is not None else time.time())
@@ -305,16 +316,39 @@ class TradingBot:
             f"{micro_to_display(int(view.equity * frac))}"
             for name, frac in budgets.items())
         halt = f" HALTED({'; '.join(status.reasons)})" if status.halted else ""
+        day_frac = (status.day_pnl / status.day_anchor) if status.day_anchor else 0.0
         logger.info(
             "equity %s (day %+0.2f%%, dd %.1f%%) cash %s mtm %s escrow %s | "
             "pos %d orders %d | %s%s",
-            micro_to_display(view.equity),
-            (status.day_pnl / status.day_anchor * 100) if status.day_anchor else 0.0,
+            micro_to_display(view.equity), day_frac * 100,
             status.drawdown_frac * 100,
             micro_to_display(view.cash), micro_to_display(view.mtm),
             micro_to_display(view.resting_escrow),
             len(view.positions), len(view.orders), deployed, halt,
         )
+        if self.status_listener is not None:
+            try:
+                self.status_listener({
+                    "ts": view.ts,
+                    "mode": "paper" if self.paper else "live",
+                    "env": self.cfg.env,
+                    "equity": view.equity,
+                    "cash": view.cash,
+                    "mtm": view.mtm,
+                    "escrow": view.resting_escrow,
+                    "day_pnl": status.day_pnl,
+                    "day_frac": day_frac,
+                    "drawdown_frac": status.drawdown_frac,
+                    "positions": len(view.positions),
+                    "orders": len(view.orders),
+                    "halted": status.halted,
+                    "halt_reasons": list(status.reasons),
+                    "used": dict(used),
+                    "budgets": {name: int(view.equity * frac)
+                                for name, frac in budgets.items()},
+                })
+            except Exception:  # pragma: no cover - observer must never kill the loop
+                logger.exception("status listener failed")
 
     # -------------------------------------------------------------- shutdown
     def _install_signal_handlers(self) -> None:
