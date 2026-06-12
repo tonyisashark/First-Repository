@@ -79,6 +79,28 @@ def market_volume(market: dict) -> float:
     return 0.0
 
 
+def orderbook_bid_depth(orderbook: dict, side: str = "yes") -> float:
+    """Total resting buy quantity on one side of an orderbook, in contracts.
+
+    The orderbook payload lists price levels as ``[price, quantity]`` pairs under
+    ``"yes"`` / ``"no"`` (legacy integer cents) or ``"yes_dollars"`` /
+    ``"no_dollars"`` (decimal-string) keys.  The summed quantity is how many
+    contracts could currently be sold into that side's bids.
+    """
+    levels = orderbook.get(f"{side}_dollars")
+    if levels is None:
+        levels = orderbook.get(side)
+    if not levels:
+        return 0.0
+    total = 0.0
+    for level in levels:
+        try:
+            total += to_float(level[1])
+        except (IndexError, TypeError):
+            continue
+    return total
+
+
 def position_contracts(position: dict) -> float:
     """Signed contract count for a position (positive = long YES)."""
     for key in ("position_fp", "position"):

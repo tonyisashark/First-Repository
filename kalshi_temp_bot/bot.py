@@ -3,18 +3,22 @@
 Manages up to ``max_positions`` concurrent YES positions. Each position runs its
 own small lifecycle:
 
-BUYING   a YES buy (limit @ 90c) is working -- waiting for fill(s)
-HOLDING  contracts held with a resting YES sell (limit @ 99c) working
+BUYING   a YES buy (limit at the target chance) is working -- waiting for fill(s)
+HOLDING  contracts held while the order book's bid depth is monitored
 EXITING  a forced close-out (aggressive sell) is working
 
 Exit rules, per position:
-* take-profit -- the resting sell at 99c fills; or
-* stop-loss   -- the YES bid falls to/below ``min_sell_price_cents`` (if > 0); or
-* close       -- never carry a position through market close: force-sell
-                 ``force_sell_buffer_seconds`` before it.
+* liquidity -- the book's total YES-bid depth falls to/below
+               ``liquidity_exit_buffer x position size``: sell right before the
+               liquidity needed to exit runs out; or
+* stop-loss -- the YES bid falls to/below ``min_sell_price_cents`` (if > 0); or
+* close     -- never carry a position through market close: force-sell
+               ``force_sell_buffer_seconds`` before it.
 
-A position whose market currently has no exit liquidity (no YES bid) does NOT
-count against ``max_positions``, so a stuck position can't block new trades.
+A sell is only ever attempted while the market has at least one YES bid --
+a worthless position with an empty book is held quietly (selling into nothing
+just fails) and does NOT count against ``max_positions``, so a stuck position
+can't block new trades.
 """
 
 from __future__ import annotations
@@ -61,9 +65,10 @@ class Trade:
     buy_price: Optional[int]
     state: TradeState = TradeState.BUYING
     buy_order: Optional[dict] = None
-    sell_order: Optional[dict] = None
     exit_order: Optional[dict] = None
     buy_placed_at: float = 0.0
+    depth_checked_at: float = 0.0          # last order-book depth poll
+    bid_depth: Optional[float] = None      # last observed total YES-bid depth
 
 
 class TradingBot:
@@ -142,7 +147,7 @@ class TradingBot:
     def _heartbeat_message(self, markets: List[MarketView]) -> str:
         watch = idle_watch_summary(
             markets,
-            target_yes_price_cents=self.cfg.buy_yes_price_cents,
+            target_chance_cents=self.cfg.buy_chance_cents,
             volume_threshold_ratio=self.cfg.volume_threshold_ratio,
             scope=self.cfg.max_volume_scope,
             min_seconds_to_close=self.cfg.min_seconds_to_close,
@@ -155,7 +160,8 @@ class TradingBot:
             market = self._market_for(markets, trade.ticker)
             bid = market.yes_bid if market else None
             bid_txt = f"{bid}c" if bid is not None else "?"
-            briefs.append(f"{trade.ticker} x{trade.count} {trade.state.value} bid {bid_txt}")
+            depth_txt = f" depth {trade.bid_depth:.0f}" if trade.bid_depth is not None else ""
+            briefs.append(f"{trade.ticker} x{trade.count} {trade.state.value} bid {bid_txt}{depth_txt}")
         more = f" +{len(self.trades) - 3} more" if len(self.trades) > 3 else ""
         return f"{watch} | {head} [{'; '.join(briefs)}{more}]"
 
@@ -238,7 +244,7 @@ class TradingBot:
             c
             for c in select_buy_candidates(
                 markets,
-                target_yes_price_cents=self.cfg.buy_yes_price_cents,
+                target_chance_cents=self.cfg.buy_chance_cents,
                 volume_threshold_ratio=self.cfg.volume_threshold_ratio,
                 scope=self.cfg.max_volume_scope,
                 min_seconds_to_close=self.cfg.min_seconds_to_close,
@@ -250,31 +256,31 @@ class TradingBot:
             return
 
         balance = self._budget_balance_cents()
-        count = position_size(balance, self.cfg.portfolio_fraction, self.cfg.buy_yes_price_cents)
+        count = position_size(balance, self.cfg.portfolio_fraction, self.cfg.buy_chance_cents)
         if count < 1:
             logger.info(
-                "Candidate %s found but balance %s c too small to buy at %s c",
-                best.ticker, balance, self.cfg.buy_yes_price_cents,
+                "Candidate %s found but balance %s c too small to buy at %s%% chance",
+                best.ticker, balance, self.cfg.buy_chance_cents,
             )
             return
         self._open_trade(best, count, balance)
 
     def _open_trade(self, market: MarketView, count: int, balance: int) -> None:
         logger.info(
-            "ENTER %s | vol=%.0f | buying %d YES @ %dc (sizing from %s c balance)",
-            market.ticker, market.volume, count, self.cfg.buy_yes_price_cents, balance,
+            "ENTER %s | vol=%.0f | buying %d YES @ %d%% chance (sizing from %s c balance)",
+            market.ticker, market.volume, count, self.cfg.buy_chance_cents, balance,
         )
-        trade = Trade(ticker=market.ticker, count=count, buy_price=self.cfg.buy_yes_price_cents)
+        trade = Trade(ticker=market.ticker, count=count, buy_price=self.cfg.buy_chance_cents)
 
         if self.cfg.dry_run:
-            logger.info("[PAPER] filled buy %d %s @ %dc", count, market.ticker, self.cfg.buy_yes_price_cents)
+            logger.info("[PAPER] filled buy %d %s @ %dc", count, market.ticker, self.cfg.buy_chance_cents)
             self._begin_holding(trade)
         else:
             trade.buy_order = self.client.create_order(
                 ticker=market.ticker,
                 is_buy=True,
                 count=count,
-                price_cents=self.cfg.buy_yes_price_cents,
+                price_cents=self.cfg.buy_chance_cents,
                 time_in_force="good_till_canceled",
             )
             trade.buy_placed_at = time.time()
@@ -282,18 +288,11 @@ class TradingBot:
         self.trades.append(trade)
 
     def _begin_holding(self, trade: Trade) -> None:
-        if self.cfg.dry_run:
-            logger.info("[PAPER] resting SELL %d %s @ %dc", trade.count, trade.ticker, self.cfg.sell_yes_price_cents)
-            trade.sell_order = {"order_id": "paper", "status": "resting"}
-        else:
-            trade.sell_order = self.client.create_order(
-                ticker=trade.ticker,
-                is_buy=False,
-                count=trade.count,
-                price_cents=self.cfg.sell_yes_price_cents,
-                time_in_force="good_till_canceled",
-            )
-            logger.info("Resting sell placed for %d %s @ %dc", trade.count, trade.ticker, self.cfg.sell_yes_price_cents)
+        logger.info(
+            "Holding %d %s; will sell when bid depth <= %.1fx position (%.0f contracts)",
+            trade.count, trade.ticker, self.cfg.liquidity_exit_buffer,
+            trade.count * self.cfg.liquidity_exit_buffer,
+        )
         trade.state = TradeState.HOLDING
 
     # -- per-position management ------------------------------------------
@@ -305,7 +304,7 @@ class TradingBot:
         if trade.state is TradeState.HOLDING:
             return self._trade_manage_holding(trade, markets)
         if trade.state is TradeState.EXITING:
-            return self._trade_check_exit(trade)
+            return self._trade_check_exit(trade, markets)
         return False
 
     def _trade_check_buy(self, trade: Trade) -> bool:
@@ -344,33 +343,52 @@ class TradingBot:
             return self._force_exit(trade, "closed")
 
         # 2) Stop-loss: sell once the bid falls to/below the floor (if enabled).
-        if (
-            self.cfg.min_sell_price_cents > 0
-            and market.yes_bid is not None
-            and market.yes_bid <= self.cfg.min_sell_price_cents
-        ):
-            logger.info(
-                "%s bid %dc <= stop %dc -- selling (stop-loss)",
-                trade.ticker, market.yes_bid, self.cfg.min_sell_price_cents,
-            )
-            return self._force_exit(trade, "stop-loss")
+        #    Only when an actual bid exists -- a worthless position with an empty
+        #    book can't be sold, so attempting it would just fail repeatedly.
+        if self.cfg.min_sell_price_cents > 0 and market.yes_bid is not None:
+            if market.yes_bid <= 0:
+                logger.debug("%s has no bid -- stop-loss armed but nothing to sell into", trade.ticker)
+            elif market.yes_bid <= self.cfg.min_sell_price_cents:
+                logger.info(
+                    "%s bid %dc <= stop %dc -- selling (stop-loss)",
+                    trade.ticker, market.yes_bid, self.cfg.min_sell_price_cents,
+                )
+                return self._force_exit(trade, "stop-loss")
 
-        # 3) Take-profit: the resting 99c sell does the work in live mode.
-        if self.cfg.dry_run:
-            if market.yes_bid is not None and market.yes_bid >= self.cfg.sell_yes_price_cents:
-                logger.info("[PAPER] sell filled %s @ %dc -- position closed", trade.ticker, market.yes_bid)
-                return True
+        # 3) Liquidity exit: sell while the book still has enough bid depth to
+        #    actually fill the position, instead of waiting for a price target.
+        if self._liquidity_exit_due(trade):
+            return self._force_exit(trade, "liquidity")
+        return False
+
+    def _liquidity_exit_due(self, trade: Trade) -> bool:
+        """True when the book's sellable YES-bid depth has shrunk to the exit
+        threshold: low enough to act, but still enough to fill the position."""
+        now = time.time()
+        if (now - trade.depth_checked_at) < self.cfg.liquidity_poll_seconds:
             return False
-        if int(self.client.get_position_contracts(trade.ticker)) <= 0:
-            logger.info("Position %s closed at target %dc", trade.ticker, self.cfg.sell_yes_price_cents)
+        get_orderbook = getattr(self.client, "get_orderbook", None)
+        if get_orderbook is None:
+            return False
+        trade.depth_checked_at = now
+        try:
+            depth = money.orderbook_bid_depth(get_orderbook(trade.ticker))
+        except Exception as exc:
+            logger.warning("Orderbook fetch for %s failed: %s", trade.ticker, exc)
+            return False
+        trade.bid_depth = depth
+        if depth <= 0:
+            # Empty book: nothing to sell into, so a sell would only fail.
+            return False
+        if depth <= trade.count * self.cfg.liquidity_exit_buffer:
+            logger.info(
+                "%s bid depth %.0f <= %.1fx position (%d) -- selling before liquidity runs out",
+                trade.ticker, depth, self.cfg.liquidity_exit_buffer, trade.count,
+            )
             return True
         return False
 
     def _force_exit(self, trade: Trade, reason: str) -> bool:
-        # Cancel the resting take-profit sell first so it doesn't compete.
-        self._cancel(trade.sell_order)
-        trade.sell_order = None
-
         if self.cfg.dry_run:
             logger.info("[PAPER] %s sold at market (%s) -- position closed", trade.ticker, reason)
             return True
@@ -383,12 +401,17 @@ class TradingBot:
         trade.state = TradeState.EXITING
         return False
 
-    def _trade_check_exit(self, trade: Trade) -> bool:
+    def _trade_check_exit(self, trade: Trade, markets: List[MarketView]) -> bool:
         held = int(self.client.get_position_contracts(trade.ticker))
         if held <= 0:
             logger.info("Force-sell complete; %s flat", trade.ticker)
             return True
-        # Some size couldn't be sold (thin book). Re-sweep aggressively.
+        # Some size couldn't be sold (thin book). Re-sweep aggressively -- but
+        # only while there is a bid to sell into; selling into an empty book
+        # just fails, so wait quietly for liquidity to return instead.
+        if not self._has_exit_liquidity(trade, markets):
+            logger.debug("%s still holds %d but the book is empty; waiting for bids", trade.ticker, held)
+            return False
         logger.warning("%s still holds %d after force-sell; re-sweeping", trade.ticker, held)
         trade.exit_order = self.client.create_order(
             ticker=trade.ticker, is_buy=False, count=held, market_order=True,

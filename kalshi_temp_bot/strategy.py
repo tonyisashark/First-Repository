@@ -6,8 +6,9 @@ Strategy summary
 ----------------
 * Universe: daily-temperature *range* markets (one bucket = one market).
 * Buy candidate: a market whose volume is >= 2/3 of the maximum-volume market
-  AND whose YES *ask* is exactly the target price (90c).  The "maximum volume"
-  is the single highest-volume **range** market -- not an event-aggregate total.
+  AND whose chance (YES price; 1 cent = 1% chance) is exactly the target.  The
+  "maximum volume" is the single highest-volume **range** market -- not an
+  event-aggregate total.
 * Only one trade at a time, so among all candidates we pick the single best
   (highest volume) to enter.
 """
@@ -100,7 +101,7 @@ def volume_qualifying_markets(
 def select_buy_candidates(
     markets: List[MarketView],
     *,
-    target_yes_price_cents: int,
+    target_chance_cents: int,
     volume_threshold_ratio: float,
     scope: str = "global",
     min_seconds_to_close: Optional[int] = None,
@@ -109,8 +110,8 @@ def select_buy_candidates(
     """Return every market that satisfies the buy rule.
 
     A market qualifies when, within its volume-comparison group, its volume is
-    ``>= volume_threshold_ratio * max_group_volume`` *and* its YES ask equals
-    ``target_yes_price_cents``.
+    ``>= volume_threshold_ratio * max_group_volume`` *and* its chance -- the YES
+    ask in cents, where 1 cent = 1% chance -- equals ``target_chance_cents``.
 
     ``scope`` controls the comparison group for "maximum volume":
       * ``"global"`` -> compared against the single highest-volume range market
@@ -124,7 +125,7 @@ def select_buy_candidates(
     for market in volume_qualifying_markets(
         markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
     ):
-        if market.yes_ask != target_yes_price_cents:
+        if market.yes_ask != target_chance_cents:
             continue
         if min_seconds_to_close is not None:
             stc = seconds_to_close(market, now)
@@ -156,7 +157,7 @@ def position_size(balance_cents: int, portfolio_fraction: float, price_cents: in
 def idle_watch_summary(
     markets: List[MarketView],
     *,
-    target_yes_price_cents: int,
+    target_chance_cents: int,
     volume_threshold_ratio: float,
     scope: str = "global",
     min_seconds_to_close: Optional[int] = None,
@@ -165,8 +166,8 @@ def idle_watch_summary(
     """One-line, human-readable summary of what the bot is watching while idle.
 
     Reports how many markets/events are tracked, how many currently match the buy
-    rule, and (if none do) the volume-qualifying market whose ask is closest to the
-    target -- i.e. how close the bot is to triggering.
+    rule, and (if none do) the volume-qualifying market whose chance is closest to
+    the target -- i.e. how close the bot is to triggering.
     """
     if not markets:
         return "watching 0 markets -- check Environment=prod and the series tickers"
@@ -175,7 +176,7 @@ def idle_watch_summary(
     n_events = len({m.event_ticker for m in markets})
     candidates = select_buy_candidates(
         markets,
-        target_yes_price_cents=target_yes_price_cents,
+        target_chance_cents=target_chance_cents,
         volume_threshold_ratio=volume_threshold_ratio,
         scope=scope,
         min_seconds_to_close=min_seconds_to_close,
@@ -183,7 +184,7 @@ def idle_watch_summary(
     )
     parts = [
         f"watching {len(markets)} markets / {n_events} events",
-        f"{len(candidates)} at {target_yes_price_cents}c",
+        f"{len(candidates)} at {target_chance_cents}% chance",
     ]
     # Only consider markets with real liquidity (ignore rail-priced 0/1/99/100
     # buckets) when reporting the closest market to the buy price.
@@ -195,6 +196,6 @@ def idle_watch_summary(
         if has_liquidity(m)
     ]
     if qualifying and not candidates:
-        closest = min(qualifying, key=lambda m: abs(m.yes_ask - target_yes_price_cents))
-        parts.append(f"closest qualifying {closest.ticker} ask {closest.yes_ask}c")
+        closest = min(qualifying, key=lambda m: abs(m.yes_ask - target_chance_cents))
+        parts.append(f"closest qualifying {closest.ticker} chance {closest.yes_ask}%")
     return " | ".join(parts)

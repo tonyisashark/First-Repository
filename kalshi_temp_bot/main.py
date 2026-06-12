@@ -74,7 +74,7 @@ def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
         m.ticker
         for m in select_buy_candidates(
             views,
-            target_yes_price_cents=cfg.buy_yes_price_cents,
+            target_chance_cents=cfg.buy_chance_cents,
             volume_threshold_ratio=cfg.volume_threshold_ratio,
             scope=cfg.max_volume_scope,
             min_seconds_to_close=cfg.min_seconds_to_close,
@@ -90,7 +90,7 @@ def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
         ask = "-" if m.yes_ask is None else str(m.yes_ask)
         print(f"{flag:<5}{m.ticker:<28}{m.event_ticker:<22}{m.volume:>10.0f}{bid:>9}{ask:>9}")
     print(f"\n{len(candidates)} candidate(s) match the buy rule "
-          f"(vol >= {cfg.volume_threshold_ratio:.2%} of event max AND yes_ask == {cfg.buy_yes_price_cents}c).")
+          f"(vol >= {cfg.volume_threshold_ratio:.2%} of event max AND chance == {cfg.buy_chance_cents}%).")
     return 0
 
 

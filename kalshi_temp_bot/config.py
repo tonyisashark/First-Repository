@@ -106,9 +106,15 @@ class Config:
     temperature_series: List[str] = field(default_factory=lambda: list(DEFAULT_TEMPERATURE_SERIES))
 
     # --- strategy parameters ---
-    buy_yes_price_cents: int = 90          # buy YES only when the ask is exactly this
-    sell_yes_price_cents: int = 99         # resting sell (take-profit) target
+    # Buy when a market's chance (its YES price; 1 cent = 1% chance) is exactly this.
+    buy_chance_cents: int = 90
+    # Exit on liquidity, not price: force-sell while the book still has enough
+    # bid depth to fill the position. Triggers when the total resting YES-bid
+    # quantity falls to/below ``liquidity_exit_buffer x position size``.
+    liquidity_exit_buffer: float = 2.0
+    liquidity_poll_seconds: float = 5.0    # how often to poll the order book per position
     # Stop-loss: if the YES bid falls to or below this, sell the position. 0 = off.
+    # Never fires when there is no bid at all (nothing to sell into).
     min_sell_price_cents: int = 0
     # Maximum number of concurrent positions. A position whose market has no exit
     # liquidity (no YES bid) does NOT count against this cap.
@@ -162,8 +168,10 @@ class Config:
             dry_run=_get_bool("DRY_RUN", True),
             paper_balance_cents=_get_int("PAPER_BALANCE_CENTS", 1_000_00),
             temperature_series=series,
-            buy_yes_price_cents=_get_int("BUY_YES_PRICE_CENTS", 90),
-            sell_yes_price_cents=_get_int("SELL_YES_PRICE_CENTS", 99),
+            # BUY_YES_PRICE_CENTS is the legacy name for the same knob.
+            buy_chance_cents=_get_int("BUY_CHANCE_CENTS", _get_int("BUY_YES_PRICE_CENTS", 90)),
+            liquidity_exit_buffer=_get_float("LIQUIDITY_EXIT_BUFFER", 2.0),
+            liquidity_poll_seconds=_get_float("LIQUIDITY_POLL_SECONDS", 5.0),
             min_sell_price_cents=_get_int("MIN_SELL_PRICE_CENTS", 0),
             max_positions=_get_int("MAX_POSITIONS", 1),
             volume_threshold_ratio=_get_float("VOLUME_THRESHOLD_RATIO", 2.0 / 3.0),

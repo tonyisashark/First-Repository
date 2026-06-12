@@ -155,6 +155,10 @@ class KalshiClient:
     def get_market(self, ticker: str) -> dict:
         return self._request("GET", f"/markets/{ticker}").get("market", {})
 
+    def get_orderbook(self, ticker: str) -> dict:
+        """Full resting-order book for one market: price levels per side."""
+        return self._request("GET", f"/markets/{ticker}/orderbook").get("orderbook", {}) or {}
+
     # -- portfolio (auth) --------------------------------------------------
     def get_balance(self) -> dict:
         return self._request("GET", "/portfolio/balance", require_auth=True)

@@ -31,8 +31,8 @@ def test_idle_summary_skips_no_liquidity_closest():
         mk("LIQUID", volume=300, yes_ask=70),  # real liquidity, further from 90
     ]
     summary = idle_watch_summary(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
-    assert "closest qualifying LIQUID ask 70c" in summary
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+    assert "closest qualifying LIQUID chance 70%" in summary
     assert "RAIL" not in summary
 
 NOW = datetime(2026, 6, 8, 12, 0, 0, tzinfo=timezone.utc)
@@ -74,21 +74,21 @@ def test_selects_when_volume_and_price_match():
         mk("WRONGPRICE", volume=300, yes_ask=89),  # enough volume but wrong price
     ]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
     assert got == {"MAX", "TWO_THIRDS"}
 
 
 def test_threshold_is_inclusive_at_exactly_two_thirds():
     markets = [mk("MAX", volume=300, yes_ask=90), mk("EQ", volume=200.0, yes_ask=90)]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
     assert "EQ" in got
 
 
 def test_price_must_be_exact():
     markets = [mk("A", volume=100, yes_ask=91), mk("B", volume=100, yes_ask=90)]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
     assert got == {"B"}
 
 
@@ -102,7 +102,7 @@ def test_event_scope_isolates_max_per_event():
         mk("CHI_OK", event="CHI", volume=80, yes_ask=90),    # 80 >= 2/3*120 -> candidate
     ]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3,
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3,
         scope="event", now=NOW)}
     assert got == {"CHI_MAX", "CHI_OK"}
 
@@ -115,7 +115,7 @@ def test_default_scope_is_global():
         mk("CHI_MAX", event="CHI", volume=120, yes_ask=90),
     ]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
     assert got == set()
 
 
@@ -125,7 +125,7 @@ def test_global_scope_uses_single_max():
         mk("CHI_MAX", event="CHI", volume=120, yes_ask=90),  # < 2/3*900 -> excluded globally
     ]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3,
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3,
         scope="global", now=NOW)}
     assert got == set()
 
@@ -136,7 +136,7 @@ def test_skips_markets_closing_too_soon():
         mk("LATER", volume=300, yes_ask=90, close_in_s=9999),
     ]
     got = {m.ticker for m in select_buy_candidates(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3,
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3,
         min_seconds_to_close=300, now=NOW)}
     assert got == {"LATER"}
 
@@ -182,20 +182,20 @@ def test_idle_summary_reports_counts_and_closest():
         mk("LOW", volume=10, yes_ask=90),    # at 90 but fails volume -> not a candidate
     ]
     summary = idle_watch_summary(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
     assert "watching 3 markets" in summary
-    assert "0 at 90c" in summary
-    assert "closest qualifying MAX ask 92c" in summary
+    assert "0 at 90% chance" in summary
+    assert "closest qualifying MAX chance 92%" in summary
 
 
 def test_idle_summary_empty():
     assert "watching 0 markets" in idle_watch_summary(
-        [], target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+        [], target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
 
 
 def test_idle_summary_hides_closest_when_candidate_exists():
     markets = [mk("HIT", volume=300, yes_ask=90)]
     summary = idle_watch_summary(
-        markets, target_yes_price_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
-    assert "1 at 90c" in summary
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)
+    assert "1 at 90% chance" in summary
     assert "closest" not in summary

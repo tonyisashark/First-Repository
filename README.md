@@ -4,12 +4,15 @@ A Python bot that trades **YES** on Kalshi daily-temperature markets using a
 simple, fully-specified rule set:
 
 - **Entry:** buy YES in a temperature *range* market whose volume is **≥ 2/3 of
-  the maximum-volume range market**, but **only when the YES ask is exactly
-  90¢**.
+  the maximum-volume range market**, but **only when the chance is exactly the
+  target** (`BUY_CHANCE_CENTS`, default 90 — 1¢ = 1% chance).
 - **Size:** deploy **1/3 of the current portfolio** on each trade.
-- **Exit:** rest a sell at **exactly 99¢** (take-profit), with an optional
-  **stop-loss** (`MIN_SELL_PRICE_CENTS`) that sells once the bid falls to/below a
-  floor.
+- **Exit:** liquidity-aware — the bot watches the order book and **sells right
+  before the bid liquidity needed to exit runs out** (when total YES-bid depth
+  falls to ≤ `LIQUIDITY_EXIT_BUFFER` × position size). An optional **stop-loss**
+  (`MIN_SELL_PRICE_CENTS`) sells once the bid falls to/below a floor. Sells are
+  only ever attempted while the book has at least one bid; a worthless position
+  with an empty book is held quietly instead of spamming doomed sell orders.
 - **Concurrency:** up to **`MAX_POSITIONS`** positions at once (default 1). A
   position whose market has no exit liquidity (no YES bid) doesn't consume a slot,
   so a stuck position can't block new trades.
@@ -31,9 +34,9 @@ simple, fully-specified rule set:
                  ┌─────────── scan temperature markets (REST, every ~5s) ───────────┐
                  │            overlay realtime prices (WebSocket ticker)             │
                  ▼                                                                   │
-   IDLE ──find candidate──▶ BUYING ──filled──▶ HOLDING ──bid hits 99¢──▶ IDLE       │
-    ▲   (vol ≥ 2/3 max &     (limit buy        (resting sell                         │
-    │    yes_ask == 90¢)      @ 90¢)            @ 99¢)                                │
+   IDLE ──find candidate──▶ BUYING ──filled──▶ HOLDING ──bid depth low──▶ IDLE      │
+    ▲   (vol ≥ 2/3 max &     (limit buy        (watch order-book                     │
+    │    chance == 90%)       @ 90¢)            bid depth)                            │
     │                                              │                                 │
     └──────────────────── force-sell ◀── near close (≤ 60s to midnight) ────────────┘
 ```
@@ -135,9 +138,10 @@ All settings are environment variables (see `.env.example`). Highlights:
 | `KALSHI_ENV` | `demo` | `demo` or `prod` |
 | `DRY_RUN` | `true` | `true` = paper trade (no real orders) |
 | `TEMPERATURE_SERIES` | built-in list | comma-separated series tickers to monitor |
-| `BUY_YES_PRICE_CENTS` | `90` | exact YES ask required to buy |
-| `SELL_YES_PRICE_CENTS` | `99` | resting sell (take-profit) target |
-| `MIN_SELL_PRICE_CENTS` | `0` | stop-loss: sell if YES bid ≤ this (`0` = off) |
+| `BUY_CHANCE_CENTS` | `90` | exact chance (¢ = %) required to buy (legacy name: `BUY_YES_PRICE_CENTS`) |
+| `LIQUIDITY_EXIT_BUFFER` | `2.0` | sell when YES-bid depth ≤ this × position size |
+| `LIQUIDITY_POLL_SECONDS` | `5.0` | order-book depth poll cadence per held position |
+| `MIN_SELL_PRICE_CENTS` | `0` | stop-loss: sell if YES bid ≤ this (`0` = off; never fires on an empty book) |
 | `MAX_POSITIONS` | `1` | max concurrent positions (no-liquidity ones don't count) |
 | `VOLUME_THRESHOLD_RATIO` | `0.6667` | fraction of max volume required (2/3) |
 | `PORTFOLIO_FRACTION` | `0.3333` | fraction of portfolio per trade (1/3) |
@@ -156,9 +160,13 @@ All settings are environment variables (see `.env.example`). Highlights:
 A few points in the spec needed a concrete reading; these are the choices made
 (all configurable):
 
-- **"YES price" for buying = the YES _ask_** (the price you actually pay), and
-  **"sell price" = the YES _bid_** (what a buyer will pay you). So the bot buys
-  when `yes_ask == 90¢` and the 99¢ sell fills when `yes_bid` reaches 99¢.
+- **"Chance" = the YES price** (1¢ = 1% chance). For buying it is read from the
+  YES _ask_ (the price you actually pay), so the bot buys when the ask equals
+  `BUY_CHANCE_CENTS`.
+- **Liquidity exit:** while holding, the bot polls the market's order book and
+  sums the resting YES-bid quantity. When that depth falls to or below
+  `LIQUIDITY_EXIT_BUFFER × position size`, it sells immediately — capturing the
+  ride up while there is still enough liquidity left to actually fill the exit.
 - **"Portfolio" = available cash balance.** Since only one trade runs and it
   starts from cash, the cash balance equals portfolio value at entry.
 - **"Midnight / market close"** uses each market's actual `close_time` from the

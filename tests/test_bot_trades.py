@@ -1,5 +1,5 @@
 """Tests for multi-position management: max positions, the no-liquidity slot
-exemption, the stop-loss, take-profit and close-deadline exits (paper mode)."""
+exemption, the stop-loss, liquidity-aware and close-deadline exits (paper mode)."""
 
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,19 +13,31 @@ NOW = datetime.now(timezone.utc)
 
 class FakeClient:
     auth = None  # -> paper-balance sizing, no network
+    # no get_orderbook -> the liquidity exit is silently skipped
 
 
-def make_bot(**overrides):
+class FakeOrderbookClient(FakeClient):
+    """FakeClient that also serves a fixed orderbook for every ticker."""
+
+    def __init__(self, yes_levels):
+        self.yes_levels = yes_levels
+
+    def get_orderbook(self, ticker):
+        return {"yes": list(self.yes_levels)}
+
+
+def make_bot(client=None, **overrides):
     cfg = Config.from_env()
     cfg.dry_run = True
     cfg.scan_interval_seconds = 10_000          # we control the market cache
     cfg.heartbeat_interval_seconds = 10_000
+    cfg.liquidity_poll_seconds = 0.0            # poll the book on every tick
     cfg.paper_balance_cents = 300_00
     cfg.volume_threshold_ratio = 0.0            # any positive volume qualifies
     cfg.max_volume_scope = "global"
     for key, value in overrides.items():
         setattr(cfg, key, value)
-    return TradingBot(client=FakeClient(), config=cfg)
+    return TradingBot(client=client or FakeClient(), config=cfg)
 
 
 def mv(ticker, *, yes_ask=90, yes_bid=80, volume=1000, close_in_s=5 * 3600):
@@ -76,15 +88,30 @@ def test_no_liquidity_position_does_not_consume_a_slot():
     assert sorted(t.ticker for t in bot.trades) == ["A", "B"]
 
 
-def test_take_profit_exit():
-    bot = make_bot(max_positions=1)
-    a = mv("A", volume=300, yes_bid=80)
+def test_liquidity_exit_when_bid_depth_runs_low():
+    client = FakeOrderbookClient(yes_levels=[[97, 100_000]])  # deep book
+    bot = make_bot(client=client, max_positions=1, liquidity_exit_buffer=2.0)
+    a = mv("A", volume=300, yes_bid=97)
+    set_markets(bot, [a])
+    bot.tick()                                # enters; 111 contracts @ 90c
+    bot.tick()                                # deep book -> keep holding
+    assert bot.trades[0].state is TradeState.HOLDING
+
+    client.yes_levels = [[98, 150]]           # depth 150 <= 2.0 x 111 -> sell now
+    a.yes_bid, a.yes_ask = 98, 99             # price has ridden up meanwhile
+    bot.tick()
+    assert bot.trades == []                   # sold while liquidity remained
+
+
+def test_no_liquidity_exit_into_an_empty_book():
+    client = FakeOrderbookClient(yes_levels=[[97, 100_000]])
+    bot = make_bot(client=client, max_positions=1, liquidity_exit_buffer=2.0)
+    a = mv("A", volume=300, yes_bid=97)
     set_markets(bot, [a])
     bot.tick()
-    assert bot.trades[0].state is TradeState.HOLDING
-    a.yes_bid, a.yes_ask = 99, 100            # bid hits 99c target (market settling)
+    client.yes_levels = []                    # book emptied: nothing to sell into
     bot.tick()
-    assert bot.trades == []                   # sold -> slot freed
+    assert bot.trades[0].state is TradeState.HOLDING  # no doomed sell attempted
 
 
 def test_stop_loss_exit():
@@ -96,6 +123,17 @@ def test_stop_loss_exit():
     a.yes_bid, a.yes_ask = 85, 86             # bid at/below the stop -> sell
     bot.tick()
     assert bot.trades == []
+
+
+def test_stop_loss_skips_worthless_position_with_no_bid():
+    bot = make_bot(max_positions=1, min_sell_price_cents=85)
+    a = mv("A", volume=300, yes_bid=88)
+    set_markets(bot, [a])
+    bot.tick()
+    assert bot.trades[0].state is TradeState.HOLDING
+    a.yes_bid, a.yes_ask = 0, 1               # worthless AND no bid to sell into
+    bot.tick()
+    assert bot.trades[0].state is TradeState.HOLDING  # held, not "failed to sell"
 
 
 def test_force_sell_before_close():
