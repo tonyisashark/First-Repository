@@ -178,7 +178,10 @@ def test_resting_bid_reprices_when_the_book_moves():
     bot.maker_buy_timeout = 0.0
     bot.tick()
     assert bot.trades[0].buy_price == 41
-    a.yes_bid = 44                                 # bid moved up underneath us
+    # The bid moves up underneath us -- in the quote feed AND the book (the
+    # right-level check accepts either source vouching for the old level).
+    a.yes_bid = 44
+    bot.client.books["A"] = {"yes": [[44, 2000]], "no": [[44, 100]]}
     bot.tick()                                     # off-level -> cancel + repost
     assert bot.trades[0].buy_price == 45           # fresh bid one tick inside
 
