@@ -359,10 +359,11 @@ class TradingBot:
 
     def _fresh_micro_estimates(self) -> Dict[str, float]:
         """Smoothed microprices recent enough to trust (stale ones would silently
-        override live midpoints with old data)."""
+        override live midpoints with old data). Strictly-less-than, so a zero
+        window disables reuse regardless of clock granularity."""
         now = time.time()
         max_age = max(self.cfg.liquidity_poll_seconds * 3, self.cfg.chance_smoothing_seconds)
-        return {t: v for t, (v, ts) in self._micro_ewma.items() if (now - ts) <= max_age}
+        return {t: v for t, (v, ts) in self._micro_ewma.items() if (now - ts) < max_age}
 
     def _begin_holding(self, trade: Trade) -> None:
         logger.info(
