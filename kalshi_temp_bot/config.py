@@ -106,7 +106,9 @@ class Config:
     temperature_series: List[str] = field(default_factory=lambda: list(DEFAULT_TEMPERATURE_SERIES))
 
     # --- strategy parameters ---
-    # Buy when a market's chance (its YES price; 1 cent = 1% chance) is exactly this.
+    # Buy when a market's chance is exactly this (cents; 1 cent = 1%). "Chance"
+    # is the percentage Kalshi displays per market: the last traded YES price,
+    # which is not necessarily the current YES ask.
     buy_chance_cents: int = 90
     # Exit on liquidity, not price: force-sell while the book still has enough
     # bid depth to fill the position. Triggers when the total resting YES-bid

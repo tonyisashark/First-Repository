@@ -40,10 +40,11 @@ def make_bot(client=None, **overrides):
     return TradingBot(client=client or FakeClient(), config=cfg)
 
 
-def mv(ticker, *, yes_ask=90, yes_bid=80, volume=1000, close_in_s=5 * 3600):
+def mv(ticker, *, yes_ask=90, yes_bid=80, chance=90, volume=1000, close_in_s=5 * 3600):
+    # ``chance`` is the displayed (last traded) price the buy rule triggers on.
     return MarketView(
         ticker=ticker, event_ticker="E", yes_bid=yes_bid, yes_ask=yes_ask,
-        last_price=85, volume=volume,
+        last_price=chance, volume=volume,
         close_time=datetime.now(timezone.utc) + timedelta(seconds=close_in_s),
         status="open",
     )
@@ -98,7 +99,7 @@ def test_liquidity_exit_when_bid_depth_runs_low():
     assert bot.trades[0].state is TradeState.HOLDING
 
     client.yes_levels = [[98, 150]]           # depth 150 <= 2.0 x 111 -> sell now
-    a.yes_bid, a.yes_ask = 98, 99             # price has ridden up meanwhile
+    a.yes_bid, a.yes_ask, a.last_price = 98, 99, 98  # price has ridden up meanwhile
     bot.tick()
     assert bot.trades == []                   # sold while liquidity remained
 
@@ -120,7 +121,7 @@ def test_stop_loss_exit():
     set_markets(bot, [a])
     bot.tick()
     assert bot.trades[0].state is TradeState.HOLDING
-    a.yes_bid, a.yes_ask = 85, 86             # bid at/below the stop -> sell
+    a.yes_bid, a.yes_ask, a.last_price = 85, 86, 85  # bid at/below the stop -> sell
     bot.tick()
     assert bot.trades == []
 

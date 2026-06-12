@@ -38,14 +38,17 @@ def test_idle_summary_skips_no_liquidity_closest():
 NOW = datetime(2026, 6, 8, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def mk(ticker, *, event="EVT", volume=0.0, yes_ask=None, yes_bid=None, close_in_s=None):
+def mk(ticker, *, event="EVT", volume=0.0, yes_ask=None, yes_bid=None, chance="ask",
+       close_in_s=None):
+    # Kalshi's displayed chance is the last traded price; unless a test sets it
+    # apart explicitly, assume the last trade happened at the current ask.
     close_time = NOW + timedelta(seconds=close_in_s) if close_in_s is not None else None
     return MarketView(
         ticker=ticker,
         event_ticker=event,
         yes_bid=yes_bid,
         yes_ask=yes_ask,
-        last_price=None,
+        last_price=yes_ask if chance == "ask" else chance,
         volume=volume,
         close_time=close_time,
     )
@@ -90,6 +93,19 @@ def test_price_must_be_exact():
     got = {m.ticker for m in select_buy_candidates(
         markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
     assert got == {"B"}
+
+
+def test_chance_is_the_last_price_not_the_ask():
+    # Kalshi's Chance column is the last traded price; a market can show 90%
+    # chance while the ask sits elsewhere (e.g. 11% chance with YES asking 10c).
+    markets = [
+        mk("CHANCE_HIT", volume=100, yes_ask=89, chance=90),    # chance matches -> buy
+        mk("ASK_MATCH", volume=100, yes_ask=90, chance=91),     # only the ask matches -> no
+        mk("NEVER_TRADED", volume=100, yes_ask=90, chance=None),  # no last price -> no
+    ]
+    got = {m.ticker for m in select_buy_candidates(
+        markets, target_chance_cents=90, volume_threshold_ratio=2 / 3, now=NOW)}
+    assert got == {"CHANCE_HIT"}
 
 
 def test_event_scope_isolates_max_per_event():

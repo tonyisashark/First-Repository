@@ -4,8 +4,9 @@ A Python bot that trades **YES** on Kalshi daily-temperature markets using a
 simple, fully-specified rule set:
 
 - **Entry:** buy YES in a temperature *range* market whose volume is **≥ 2/3 of
-  the maximum-volume range market**, but **only when the chance is exactly the
-  target** (`BUY_CHANCE_CENTS`, default 90 — 1¢ = 1% chance).
+  the maximum-volume range market**, but **only when the displayed chance is
+  exactly the target** (`BUY_CHANCE_CENTS`, default 90 — Kalshi's Chance
+  column, i.e. the last traded YES price, 1¢ = 1%).
 - **Size:** deploy **1/3 of the current portfolio** on each trade.
 - **Exit:** liquidity-aware — the bot watches the order book and **sells right
   before the bid liquidity needed to exit runs out** (when total YES-bid depth
@@ -160,9 +161,12 @@ All settings are environment variables (see `.env.example`). Highlights:
 A few points in the spec needed a concrete reading; these are the choices made
 (all configurable):
 
-- **"Chance" = the YES price** (1¢ = 1% chance). For buying it is read from the
-  YES _ask_ (the price you actually pay), so the bot buys when the ask equals
-  `BUY_CHANCE_CENTS`.
+- **"Chance" = Kalshi's Chance column**: the last traded YES price (1¢ = 1%),
+  which is *not* necessarily the current YES ask — a market can show 11% chance
+  while YES asks 10¢. The bot triggers when the chance equals
+  `BUY_CHANCE_CENTS`, then places a limit buy at that same price (so it never
+  pays more than the displayed chance; if the ask is higher the order rests
+  until filled or `BUY_TIMEOUT_SECONDS` cancels it).
 - **Liquidity exit:** while holding, the bot polls the market's order book and
   sums the resting YES-bid quantity. When that depth falls to or below
   `LIQUIDITY_EXIT_BUFFER × position size`, it sells immediately — capturing the

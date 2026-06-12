@@ -82,13 +82,14 @@ def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
     }
 
     views.sort(key=lambda m: (m.event_ticker, -m.volume))
-    print(f"{'BUY?':<5}{'TICKER':<28}{'EVENT':<22}{'VOL':>10}{'YES_BID':>9}{'YES_ASK':>9}")
-    print("-" * 83)
+    print(f"{'BUY?':<5}{'TICKER':<28}{'EVENT':<22}{'VOL':>10}{'CHANCE':>8}{'YES_BID':>9}{'YES_ASK':>9}")
+    print("-" * 91)
     for m in views:
         flag = "BUY" if m.ticker in candidates else ""
+        chance = "-" if m.last_price is None else f"{m.last_price}%"
         bid = "-" if m.yes_bid is None else str(m.yes_bid)
         ask = "-" if m.yes_ask is None else str(m.yes_ask)
-        print(f"{flag:<5}{m.ticker:<28}{m.event_ticker:<22}{m.volume:>10.0f}{bid:>9}{ask:>9}")
+        print(f"{flag:<5}{m.ticker:<28}{m.event_ticker:<22}{m.volume:>10.0f}{chance:>8}{bid:>9}{ask:>9}")
     print(f"\n{len(candidates)} candidate(s) match the buy rule "
           f"(vol >= {cfg.volume_threshold_ratio:.2%} of event max AND chance == {cfg.buy_chance_cents}%).")
     return 0

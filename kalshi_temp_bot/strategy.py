@@ -6,9 +6,10 @@ Strategy summary
 ----------------
 * Universe: daily-temperature *range* markets (one bucket = one market).
 * Buy candidate: a market whose volume is >= 2/3 of the maximum-volume market
-  AND whose chance (YES price; 1 cent = 1% chance) is exactly the target.  The
-  "maximum volume" is the single highest-volume **range** market -- not an
-  event-aggregate total.
+  AND whose chance is exactly the target.  "Chance" is the percentage Kalshi
+  displays for each market: the last traded YES price (1 cent = 1%), which is
+  *not* necessarily the current YES ask.  The "maximum volume" is the single
+  highest-volume **range** market -- not an event-aggregate total.
 * Only one trade at a time, so among all candidates we pick the single best
   (highest volume) to enter.
 """
@@ -56,6 +57,15 @@ def seconds_to_close(market: MarketView, now: Optional[datetime] = None) -> Opti
         return None
     now = now or datetime.now(timezone.utc)
     return (market.close_time - now).total_seconds()
+
+
+def market_chance(market: MarketView) -> Optional[int]:
+    """The market's "chance" as displayed by Kalshi, in percent (= cents).
+
+    Kalshi's Chance column shows the last traded YES price, not the current
+    ask -- a market can show 11% chance while the YES ask sits at 10c.
+    """
+    return market.last_price
 
 
 def has_liquidity(market: MarketView) -> bool:
@@ -110,8 +120,9 @@ def select_buy_candidates(
     """Return every market that satisfies the buy rule.
 
     A market qualifies when, within its volume-comparison group, its volume is
-    ``>= volume_threshold_ratio * max_group_volume`` *and* its chance -- the YES
-    ask in cents, where 1 cent = 1% chance -- equals ``target_chance_cents``.
+    ``>= volume_threshold_ratio * max_group_volume`` *and* its chance -- the
+    last traded YES price shown in Kalshi's Chance column, where 1 cent = 1% --
+    equals ``target_chance_cents``.
 
     ``scope`` controls the comparison group for "maximum volume":
       * ``"global"`` -> compared against the single highest-volume range market
@@ -125,7 +136,7 @@ def select_buy_candidates(
     for market in volume_qualifying_markets(
         markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
     ):
-        if market.yes_ask != target_chance_cents:
+        if market_chance(market) != target_chance_cents:
             continue
         if min_seconds_to_close is not None:
             stc = seconds_to_close(market, now)
@@ -187,15 +198,15 @@ def idle_watch_summary(
         f"{len(candidates)} at {target_chance_cents}% chance",
     ]
     # Only consider markets with real liquidity (ignore rail-priced 0/1/99/100
-    # buckets) when reporting the closest market to the buy price.
+    # buckets) and a known chance when reporting the closest market to the target.
     qualifying = [
         m
         for m in volume_qualifying_markets(
             markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
         )
-        if has_liquidity(m)
+        if has_liquidity(m) and market_chance(m) is not None
     ]
     if qualifying and not candidates:
-        closest = min(qualifying, key=lambda m: abs(m.yes_ask - target_chance_cents))
-        parts.append(f"closest qualifying {closest.ticker} chance {closest.yes_ask}%")
+        closest = min(qualifying, key=lambda m: abs(market_chance(m) - target_chance_cents))
+        parts.append(f"closest qualifying {closest.ticker} chance {market_chance(closest)}%")
     return " | ".join(parts)
