@@ -18,7 +18,7 @@ from . import money
 from .bot import TradingBot
 from .config import Config
 from .factory import build_auth, build_bot, build_client
-from .strategy import select_buy_candidates
+from .strategy import estimate_chance_cents, event_mid_sums, select_buy_candidates
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -74,24 +74,29 @@ def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
         m.ticker
         for m in select_buy_candidates(
             views,
-            target_chance_cents=cfg.buy_chance_cents,
+            min_chance_cents=cfg.buy_chance_min_cents,
+            max_chance_cents=cfg.buy_chance_max_cents,
             volume_threshold_ratio=cfg.volume_threshold_ratio,
             scope=cfg.max_volume_scope,
             min_seconds_to_close=cfg.min_seconds_to_close,
+            max_spread_cents=cfg.max_spread_cents,
         )
     }
+    event_sums = event_mid_sums(views)
 
     views.sort(key=lambda m: (m.event_ticker, -m.volume))
     print(f"{'BUY?':<5}{'TICKER':<28}{'EVENT':<22}{'VOL':>10}{'CHANCE':>8}{'YES_BID':>9}{'YES_ASK':>9}")
     print("-" * 91)
     for m in views:
         flag = "BUY" if m.ticker in candidates else ""
-        chance = "-" if m.last_price is None else f"{m.last_price}%"
+        est = estimate_chance_cents(m, event_sums)
+        chance = "-" if est is None else f"{est:.1f}%"
         bid = "-" if m.yes_bid is None else str(m.yes_bid)
         ask = "-" if m.yes_ask is None else str(m.yes_ask)
         print(f"{flag:<5}{m.ticker:<28}{m.event_ticker:<22}{m.volume:>10.0f}{chance:>8}{bid:>9}{ask:>9}")
     print(f"\n{len(candidates)} candidate(s) match the buy rule "
-          f"(vol >= {cfg.volume_threshold_ratio:.2%} of event max AND chance == {cfg.buy_chance_cents}%).")
+          f"(vol >= {cfg.volume_threshold_ratio:.2%} of event max, spread <= {cfg.max_spread_cents}c, "
+          f"estimated chance in {cfg.buy_chance_min_cents}-{cfg.buy_chance_max_cents}%).")
     return 0
 
 

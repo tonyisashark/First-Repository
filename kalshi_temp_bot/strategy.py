@@ -6,12 +6,22 @@ Strategy summary
 ----------------
 * Universe: daily-temperature *range* markets (one bucket = one market).
 * Buy candidate: a market whose volume is >= 2/3 of the maximum-volume market
-  AND whose chance is exactly the target.  "Chance" is the percentage Kalshi
-  displays for each market: the last traded YES price (1 cent = 1%), which is
-  *not* necessarily the current YES ask.  The "maximum volume" is the single
-  highest-volume **range** market -- not an event-aggregate total.
-* Only one trade at a time, so among all candidates we pick the single best
-  (highest volume) to enter.
+  AND whose *estimated chance* falls inside the configured [min, max] band.
+* The chance estimate is built from market data rather than the raw displayed
+  number (the last trade), which is noisy and can be stale:
+    1. base  = depth-weighted midpoint ("microprice") of the order book when
+       book depth is known, else the plain bid/ask midpoint;
+    2. it is renormalized across the event: the buckets of one event are
+       mutually exclusive and exhaustive, so their probabilities must sum to
+       100% -- dividing by the event's actual mid-sum removes the structural
+       overround (longshot bias);
+    3. a maximum bid/ask spread gate rejects markets whose book is too wide to
+       mean anything ("85 bid / 99 ask" is not a 92% belief).
+  Smoothing of the microprice over time (EWMA) is the bot loop's job, since it
+  needs state; the smoothed value is passed in via ``micro_estimates``.
+* The "maximum volume" is the single highest-volume **range** market -- not an
+  event-aggregate total.  Among all candidates the single best (highest volume)
+  is entered.
 """
 
 from __future__ import annotations
@@ -59,13 +69,78 @@ def seconds_to_close(market: MarketView, now: Optional[datetime] = None) -> Opti
     return (market.close_time - now).total_seconds()
 
 
-def market_chance(market: MarketView) -> Optional[int]:
-    """The market's "chance" as displayed by Kalshi, in percent (= cents).
+# An event's bucket mids should sum to ~100 cents. Renormalize only when the
+# sum is plausibly complete; far outside this window the data is suspect
+# (buckets missing from the scan, or a degenerate test universe), so the raw
+# estimate is safer than a wildly scaled one.
+RENORM_SUM_MIN = 80.0
+RENORM_SUM_MAX = 125.0
 
-    Kalshi's Chance column shows the last traded YES price, not the current
-    ask -- a market can show 11% chance while the YES ask sits at 10c.
+
+def mid_price_cents(market: MarketView) -> Optional[float]:
+    """Bid/ask midpoint in cents. A missing bid counts as 0 (an empty bid side
+    is a real statement, not missing data); no ask means no tradeable price."""
+    if market.yes_ask is None:
+        return None
+    return ((market.yes_bid or 0) + market.yes_ask) / 2.0
+
+
+def spread_cents(market: MarketView) -> Optional[int]:
+    """Bid/ask spread in cents (missing bid counts as 0, so pinned/one-sided
+    books show a huge spread and get rejected by the spread gate)."""
+    if market.yes_ask is None:
+        return None
+    return market.yes_ask - (market.yes_bid or 0)
+
+
+def microprice_cents(
+    yes_bid: Optional[int],
+    yes_ask: Optional[int],
+    bid_depth: float,
+    ask_depth: float,
+) -> Optional[float]:
+    """Depth-weighted midpoint (Stoikov micro-price) in cents.
+
+    Weights each quote by the *opposite* side's depth, so heavy bidding pressure
+    pulls the estimate toward the ask and vice versa. Falls back to the plain
+    midpoint when either side's depth is unknown/empty.
     """
-    return market.last_price
+    if yes_bid is None or yes_ask is None:
+        return None
+    if bid_depth <= 0 or ask_depth <= 0:
+        return (yes_bid + yes_ask) / 2.0
+    return (yes_ask * bid_depth + yes_bid * ask_depth) / (bid_depth + ask_depth)
+
+
+def event_mid_sums(markets: List[MarketView]) -> Dict[str, float]:
+    """Sum of bucket midpoints per event -- the event's actual "overround"."""
+    sums: Dict[str, float] = {}
+    for market in markets:
+        mid = mid_price_cents(market)
+        if mid is None:
+            continue
+        sums[market.event_ticker] = sums.get(market.event_ticker, 0.0) + mid
+    return sums
+
+
+def estimate_chance_cents(
+    market: MarketView,
+    event_sums: Dict[str, float],
+    micro: Optional[float] = None,
+) -> Optional[float]:
+    """The market's estimated true chance in cents (= percent).
+
+    ``micro`` is an externally computed (typically EWMA-smoothed) microprice for
+    this market; without one the bid/ask midpoint is used. The base estimate is
+    renormalized by its event's bucket-mid sum when that sum looks complete.
+    """
+    base = micro if micro is not None else mid_price_cents(market)
+    if base is None:
+        return None
+    total = event_sums.get(market.event_ticker, 0.0)
+    if RENORM_SUM_MIN <= total <= RENORM_SUM_MAX:
+        return base * 100.0 / total
+    return base
 
 
 def has_liquidity(market: MarketView) -> bool:
@@ -111,18 +186,25 @@ def volume_qualifying_markets(
 def select_buy_candidates(
     markets: List[MarketView],
     *,
-    target_chance_cents: int,
+    min_chance_cents: int,
+    max_chance_cents: int,
     volume_threshold_ratio: float,
     scope: str = "global",
     min_seconds_to_close: Optional[int] = None,
+    max_spread_cents: Optional[int] = None,
+    micro_estimates: Optional[Dict[str, float]] = None,
     now: Optional[datetime] = None,
 ) -> List[MarketView]:
     """Return every market that satisfies the buy rule.
 
     A market qualifies when, within its volume-comparison group, its volume is
-    ``>= volume_threshold_ratio * max_group_volume`` *and* its chance -- the
-    last traded YES price shown in Kalshi's Chance column, where 1 cent = 1% --
-    equals ``target_chance_cents``.
+    ``>= volume_threshold_ratio * max_group_volume``, its bid/ask spread is at
+    most ``max_spread_cents`` (when set), and its estimated chance (see
+    :func:`estimate_chance_cents`) lies inside
+    ``[min_chance_cents, max_chance_cents]`` inclusive.
+
+    ``micro_estimates`` maps ticker -> smoothed microprice in cents for markets
+    where the bot has order-book data; other markets fall back to the midpoint.
 
     ``scope`` controls the comparison group for "maximum volume":
       * ``"global"`` -> compared against the single highest-volume range market
@@ -131,12 +213,19 @@ def select_buy_candidates(
         (same city/day).
     """
     now = now or datetime.now(timezone.utc)
+    micro_estimates = micro_estimates or {}
+    event_sums = event_mid_sums(markets)
 
     candidates: List[MarketView] = []
     for market in volume_qualifying_markets(
         markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
     ):
-        if market_chance(market) != target_chance_cents:
+        if max_spread_cents is not None:
+            spread = spread_cents(market)
+            if spread is None or spread > max_spread_cents:
+                continue
+        chance = estimate_chance_cents(market, event_sums, micro_estimates.get(market.ticker))
+        if chance is None or not (min_chance_cents <= chance <= max_chance_cents):
             continue
         if min_seconds_to_close is not None:
             stc = seconds_to_close(market, now)
@@ -168,17 +257,20 @@ def position_size(balance_cents: int, portfolio_fraction: float, price_cents: in
 def idle_watch_summary(
     markets: List[MarketView],
     *,
-    target_chance_cents: int,
+    min_chance_cents: int,
+    max_chance_cents: int,
     volume_threshold_ratio: float,
     scope: str = "global",
     min_seconds_to_close: Optional[int] = None,
+    max_spread_cents: Optional[int] = None,
+    micro_estimates: Optional[Dict[str, float]] = None,
     now: Optional[datetime] = None,
 ) -> str:
     """One-line, human-readable summary of what the bot is watching while idle.
 
-    Reports how many markets/events are tracked, how many currently match the buy
-    rule, and (if none do) the volume-qualifying market whose chance is closest to
-    the target -- i.e. how close the bot is to triggering.
+    Reports how many markets/events are tracked, how many currently fall in the
+    buy band, and (if none do) the volume-qualifying market whose estimated
+    chance is closest to the band -- i.e. how close the bot is to triggering.
     """
     if not markets:
         return "watching 0 markets -- check Environment=prod and the series tickers"
@@ -187,26 +279,35 @@ def idle_watch_summary(
     n_events = len({m.event_ticker for m in markets})
     candidates = select_buy_candidates(
         markets,
-        target_chance_cents=target_chance_cents,
+        min_chance_cents=min_chance_cents,
+        max_chance_cents=max_chance_cents,
         volume_threshold_ratio=volume_threshold_ratio,
         scope=scope,
         min_seconds_to_close=min_seconds_to_close,
+        max_spread_cents=max_spread_cents,
+        micro_estimates=micro_estimates,
         now=now,
     )
     parts = [
         f"watching {len(markets)} markets / {n_events} events",
-        f"{len(candidates)} at {target_chance_cents}% chance",
+        f"{len(candidates)} in {min_chance_cents}-{max_chance_cents}% chance band",
     ]
     # Only consider markets with real liquidity (ignore rail-priced 0/1/99/100
-    # buckets) and a known chance when reporting the closest market to the target.
+    # buckets) and a known estimate when reporting the closest market to the band.
+    event_sums = event_mid_sums(markets)
+    micro_estimates = micro_estimates or {}
     qualifying = [
-        m
+        (m, estimate_chance_cents(m, event_sums, micro_estimates.get(m.ticker)))
         for m in volume_qualifying_markets(
             markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
         )
-        if has_liquidity(m) and market_chance(m) is not None
+        if has_liquidity(m)
     ]
+    qualifying = [(m, c) for m, c in qualifying if c is not None]
     if qualifying and not candidates:
-        closest = min(qualifying, key=lambda m: abs(market_chance(m) - target_chance_cents))
-        parts.append(f"closest qualifying {closest.ticker} chance {market_chance(closest)}%")
+        def distance(chance: float) -> float:
+            return max(min_chance_cents - chance, chance - max_chance_cents, 0.0)
+
+        closest, chance = min(qualifying, key=lambda pair: distance(pair[1]))
+        parts.append(f"closest qualifying {closest.ticker} chance {chance:.1f}%")
     return " | ".join(parts)

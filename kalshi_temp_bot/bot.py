@@ -3,17 +3,21 @@
 Manages up to ``max_positions`` concurrent YES positions. Each position runs its
 own small lifecycle:
 
-BUYING   a YES buy (limit at the target chance) is working -- waiting for fill(s)
+BUYING   a YES buy (limit inside the chance band) is working -- waiting for fill(s)
 HOLDING  contracts held while the order book's bid depth is monitored
 EXITING  a forced close-out (aggressive sell) is working
+
+Entry triggers on the *estimated* chance: an EWMA-smoothed, depth-weighted book
+midpoint (microprice), renormalized across the event's buckets, gated by a
+maximum bid/ask spread -- and it must fall inside the configured
+``[buy_chance_min_cents, buy_chance_max_cents]`` band.
 
 Exit rules, per position:
 * liquidity -- the book's total YES-bid depth falls to/below
                ``liquidity_exit_buffer x position size``: sell right before the
                liquidity needed to exit runs out; or
-* stop-loss -- the YES bid falls to/below ``min_sell_price_cents`` (if > 0); or
-* close     -- never carry a position through market close: force-sell
-               ``force_sell_buffer_seconds`` before it.
+* stop-loss -- the YES bid falls to/below ``min_sell_price_cents`` (if > 0).
+A position that hits neither rides through market close and settles.
 
 A sell is only ever attempted while the market has at least one YES bid --
 a worthless position with an empty book is held quietly (selling into nothing
@@ -27,7 +31,7 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import money
 from .config import Config
@@ -36,10 +40,10 @@ from .kalshi_ws import KalshiWebSocket, MarketDataCache
 from .strategy import (
     MarketView,
     idle_watch_summary,
+    microprice_cents,
     parse_time,
     pick_best_candidate,
     position_size,
-    seconds_to_close,
     select_buy_candidates,
 )
 
@@ -48,6 +52,15 @@ logger = logging.getLogger(__name__)
 # Seconds to wait between successive per-series market requests during a scan,
 # so a multi-city scan doesn't burst past Kalshi's rate limit.
 SERIES_REQUEST_SPACING = 0.15
+
+# How far (cents) outside the configured buy band a market's plain-mid estimate
+# may sit and still get an order-book look -- the microprice can move the final
+# estimate a little, so the prefilter must be slightly wider than the band.
+MICRO_PREFILTER_SLACK = 3
+
+# At most this many order-book fetches per tick for entry estimation, so a
+# cluster of near-band markets can't burst past the rate limit.
+MICRO_FETCH_BUDGET_PER_TICK = 3
 
 
 class TradeState(Enum):
@@ -91,6 +104,10 @@ class TradingBot:
         self._last_heartbeat: float = 0.0
         self._current_tickers: List[str] = []
         self._running = False
+
+        # EWMA-smoothed microprice per ticker: ticker -> (value_cents, updated_at).
+        self._micro_ewma: Dict[str, Tuple[float, float]] = {}
+        self._book_polled_at: Dict[str, float] = {}
 
     # -- lifecycle ---------------------------------------------------------
     def run(self) -> None:
@@ -147,10 +164,13 @@ class TradingBot:
     def _heartbeat_message(self, markets: List[MarketView]) -> str:
         watch = idle_watch_summary(
             markets,
-            target_chance_cents=self.cfg.buy_chance_cents,
+            min_chance_cents=self.cfg.buy_chance_min_cents,
+            max_chance_cents=self.cfg.buy_chance_max_cents,
             volume_threshold_ratio=self.cfg.volume_threshold_ratio,
             scope=self.cfg.max_volume_scope,
             min_seconds_to_close=self.cfg.min_seconds_to_close,
+            max_spread_cents=self.cfg.max_spread_cents,
+            micro_estimates=self._fresh_micro_estimates(),
         )
         head = f"{self._occupied_slots(markets)}/{self.cfg.max_positions} slots, {len(self.trades)} position(s)"
         if not self.trades:
@@ -236,56 +256,113 @@ class TradingBot:
         return list(self._current_tickers)
 
     # -- entry -------------------------------------------------------------
-    def _maybe_enter(self, markets: List[MarketView]) -> None:
-        if self._occupied_slots(markets) >= self.cfg.max_positions:
-            return
+    def _select_candidates(self, markets: List[MarketView], slack: int = 0) -> List[MarketView]:
         held = {t.ticker for t in self.trades}
-        candidates = [
+        return [
             c
             for c in select_buy_candidates(
                 markets,
-                target_chance_cents=self.cfg.buy_chance_cents,
+                min_chance_cents=self.cfg.buy_chance_min_cents - slack,
+                max_chance_cents=self.cfg.buy_chance_max_cents + slack,
                 volume_threshold_ratio=self.cfg.volume_threshold_ratio,
                 scope=self.cfg.max_volume_scope,
                 min_seconds_to_close=self.cfg.min_seconds_to_close,
+                max_spread_cents=self.cfg.max_spread_cents,
+                micro_estimates=self._fresh_micro_estimates(),
             )
             if c.ticker not in held  # never double-up on the same market
         ]
-        best = pick_best_candidate(candidates)
-        if best is None:
+
+    def _maybe_enter(self, markets: List[MarketView]) -> None:
+        if self._occupied_slots(markets) >= self.cfg.max_positions:
+            return
+        # Refresh order-book microprices for markets near the band, then select
+        # with those sharper estimates.
+        self._update_micro_estimates(self._select_candidates(markets, slack=MICRO_PREFILTER_SLACK))
+        best = pick_best_candidate(self._select_candidates(markets))
+        if best is None or best.yes_ask is None:
             return
 
+        # Never bid above the top of the band: take the ask when it's inside,
+        # otherwise rest at the band's ceiling until filled or timed out.
+        limit_price = min(best.yes_ask, self.cfg.buy_chance_max_cents)
         balance = self._budget_balance_cents()
-        count = position_size(balance, self.cfg.portfolio_fraction, self.cfg.buy_chance_cents)
+        count = position_size(balance, self.cfg.portfolio_fraction, limit_price)
         if count < 1:
             logger.info(
-                "Candidate %s found but balance %s c too small to buy at %s%% chance",
-                best.ticker, balance, self.cfg.buy_chance_cents,
+                "Candidate %s found but balance %s c too small to buy at %sc",
+                best.ticker, balance, limit_price,
             )
             return
-        self._open_trade(best, count, balance)
+        self._open_trade(best, count, limit_price, balance)
 
-    def _open_trade(self, market: MarketView, count: int, balance: int) -> None:
+    def _open_trade(self, market: MarketView, count: int, limit_price: int, balance: int) -> None:
         logger.info(
-            "ENTER %s | vol=%.0f | buying %d YES @ %d%% chance (sizing from %s c balance)",
-            market.ticker, market.volume, count, self.cfg.buy_chance_cents, balance,
+            "ENTER %s | vol=%.0f | buying %d YES @ %dc (chance band %d-%d%%, sizing from %s c balance)",
+            market.ticker, market.volume, count, limit_price,
+            self.cfg.buy_chance_min_cents, self.cfg.buy_chance_max_cents, balance,
         )
-        trade = Trade(ticker=market.ticker, count=count, buy_price=self.cfg.buy_chance_cents)
+        trade = Trade(ticker=market.ticker, count=count, buy_price=limit_price)
 
         if self.cfg.dry_run:
-            logger.info("[PAPER] filled buy %d %s @ %dc", count, market.ticker, self.cfg.buy_chance_cents)
+            logger.info("[PAPER] filled buy %d %s @ %dc", count, market.ticker, limit_price)
             self._begin_holding(trade)
         else:
             trade.buy_order = self.client.create_order(
                 ticker=market.ticker,
                 is_buy=True,
                 count=count,
-                price_cents=self.cfg.buy_chance_cents,
+                price_cents=limit_price,
                 time_in_force="good_till_canceled",
             )
             trade.buy_placed_at = time.time()
             trade.state = TradeState.BUYING
         self.trades.append(trade)
+
+    # -- chance estimation (microprice + EWMA) ------------------------------
+    def _update_micro_estimates(self, near_band: List[MarketView]) -> None:
+        """Fetch order books for markets near the buy band and fold their
+        microprice into the per-ticker EWMA. Throttled per ticker and capped
+        per tick so estimation can't burst past the API rate limit."""
+        get_orderbook = getattr(self.client, "get_orderbook", None)
+        if get_orderbook is None:
+            return
+        now = time.time()
+        fetched = 0
+        for market in sorted(near_band, key=lambda m: -m.volume):
+            if fetched >= MICRO_FETCH_BUDGET_PER_TICK:
+                break
+            if (now - self._book_polled_at.get(market.ticker, 0.0)) < self.cfg.liquidity_poll_seconds:
+                continue
+            self._book_polled_at[market.ticker] = now
+            try:
+                best = money.orderbook_best_levels(get_orderbook(market.ticker))
+            except Exception as exc:
+                logger.warning("Orderbook fetch for %s failed: %s", market.ticker, exc)
+                continue
+            fetched += 1
+            micro = microprice_cents(
+                best["bid"] if best["bid"] is not None else market.yes_bid,
+                best["ask"] if best["ask"] is not None else market.yes_ask,
+                best["bid_qty"], best["ask_qty"],
+            )
+            if micro is None:
+                continue
+            previous = self._micro_ewma.get(market.ticker)
+            if previous is None or self.cfg.chance_smoothing_seconds <= 0:
+                value = micro
+            else:
+                # Half-life decay: alpha is the weight of the new sample.
+                alpha = 1.0 - 0.5 ** ((now - previous[1]) / self.cfg.chance_smoothing_seconds)
+                value = previous[0] + alpha * (micro - previous[0])
+            self._micro_ewma[market.ticker] = (value, now)
+
+    def _fresh_micro_estimates(self) -> Dict[str, float]:
+        """Smoothed microprices recent enough to trust (stale ones would silently
+        override live midpoints with old data)."""
+        now = time.time()
+        max_age = max(self.cfg.liquidity_poll_seconds * 3, self.cfg.chance_smoothing_seconds)
+        return {t: v for t, (v, ts) in self._micro_ewma.items() if (now - ts) <= max_age}
 
     def _begin_holding(self, trade: Trade) -> None:
         logger.info(
@@ -331,18 +408,16 @@ class TradingBot:
         return False
 
     def _trade_manage_holding(self, trade: Trade, markets: List[MarketView]) -> bool:
+        # Positions are deliberately carried through market close (they settle);
+        # only the stop-loss and the liquidity exit can sell.
         market = self._market_for(markets, trade.ticker)
-
-        # 1) Hard deadline: never carry a position through market close.
-        stc = seconds_to_close(market) if market else None
-        if stc is not None and stc <= self.cfg.force_sell_buffer_seconds:
-            logger.info("%s closes in %.0fs -- force-selling regardless of price", trade.ticker, stc)
-            return self._force_exit(trade, "close")
         if market is None:
-            logger.warning("%s no longer open -- force-selling to flatten", trade.ticker)
-            return self._force_exit(trade, "closed")
+            # Closed or temporarily missing from the scan: nothing actionable,
+            # but drop the trade once settlement has flattened the position.
+            logger.debug("%s not in the current scan; holding through to settlement", trade.ticker)
+            return self._settled_flat(trade)
 
-        # 2) Stop-loss: sell once the bid falls to/below the floor (if enabled).
+        # 1) Stop-loss: sell once the bid falls to/below the floor (if enabled).
         #    Only when an actual bid exists -- a worthless position with an empty
         #    book can't be sold, so attempting it would just fail repeatedly.
         if self.cfg.min_sell_price_cents > 0 and market.yes_bid is not None:
@@ -355,10 +430,29 @@ class TradingBot:
                 )
                 return self._force_exit(trade, "stop-loss")
 
-        # 3) Liquidity exit: sell while the book still has enough bid depth to
+        # 2) Liquidity exit: sell while the book still has enough bid depth to
         #    actually fill the position, instead of waiting for a price target.
         if self._liquidity_exit_due(trade):
             return self._force_exit(trade, "liquidity")
+        return False
+
+    def _settled_flat(self, trade: Trade) -> bool:
+        """True once a position in a closed/vanished market has settled away
+        (live mode only). Throttled -- this is the only API call for such trades."""
+        if self.cfg.dry_run:
+            return False
+        now = time.time()
+        if (now - trade.depth_checked_at) < max(self.cfg.liquidity_poll_seconds, 30.0):
+            return False
+        trade.depth_checked_at = now
+        try:
+            held = int(self.client.get_position_contracts(trade.ticker))
+        except Exception as exc:
+            logger.debug("Settlement check for %s failed: %s", trade.ticker, exc)
+            return False
+        if held <= 0:
+            logger.info("%s settled flat; closing out its tracking", trade.ticker)
+            return True
         return False
 
     def _liquidity_exit_due(self, trade: Trade) -> bool:

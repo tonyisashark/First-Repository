@@ -4,9 +4,12 @@ A Python bot that trades **YES** on Kalshi daily-temperature markets using a
 simple, fully-specified rule set:
 
 - **Entry:** buy YES in a temperature *range* market whose volume is **≥ 2/3 of
-  the maximum-volume range market**, but **only when the displayed chance is
-  exactly the target** (`BUY_CHANCE_CENTS`, default 90 — Kalshi's Chance
-  column, i.e. the last traded YES price, 1¢ = 1%).
+  the maximum-volume range market**, and whose **estimated chance falls inside
+  the configured band** (`BUY_CHANCE_MIN_CENTS`–`BUY_CHANCE_MAX_CENTS`, default
+  90–95; 1¢ = 1%). The estimate is built from market data rather than the noisy
+  displayed last-trade chance: a depth-weighted order-book midpoint
+  (microprice), EWMA-smoothed over time, renormalized across the event's
+  buckets (which must sum to ~100%), and gated by a maximum bid/ask spread.
 - **Size:** deploy **1/3 of the current portfolio** on each trade.
 - **Exit:** liquidity-aware — the bot watches the order book and **sells right
   before the bid liquidity needed to exit runs out** (when total YES-bid depth
@@ -17,9 +20,8 @@ simple, fully-specified rule set:
 - **Concurrency:** up to **`MAX_POSITIONS`** positions at once (default 1). A
   position whose market has no exit liquidity (no YES bid) doesn't consume a slot,
   so a stuck position can't block new trades.
-- **No overnight risk:** if a position hasn't sold by the time the market is
-  about to close (midnight), it is **force-sold regardless of price** so nothing
-  is held through the close.
+- **Settlement:** a position that hits neither exit simply **rides through
+  market close and settles** (there is no forced sell before close).
 - **Fast data:** market data is refreshed continuously via a 1s REST scan plus a
   realtime WebSocket ticker feed.
 
@@ -36,10 +38,10 @@ simple, fully-specified rule set:
                  │            overlay realtime prices (WebSocket ticker)             │
                  ▼                                                                   │
    IDLE ──find candidate──▶ BUYING ──filled──▶ HOLDING ──bid depth low──▶ IDLE      │
-    ▲   (vol ≥ 2/3 max &     (limit buy        (watch order-book                     │
-    │    chance == 90%)       @ 90¢)            bid depth)                            │
-    │                                              │                                 │
-    └──────────────────── force-sell ◀── near close (≤ 60s to midnight) ────────────┘
+    ▲   (vol ≥ 2/3 max &     (limit buy at      (watch order-book                    │
+    │    est. chance in       the ask, capped    bid depth; stop-loss)                │
+    │    90–95% band)         at band max)          │                                 │
+    └────────────────────────── sold / settled ◀────┘                                │
 ```
 
 **"Maximum volume" is a single range market**, *not* an event aggregate. For
@@ -139,7 +141,10 @@ All settings are environment variables (see `.env.example`). Highlights:
 | `KALSHI_ENV` | `demo` | `demo` or `prod` |
 | `DRY_RUN` | `true` | `true` = paper trade (no real orders) |
 | `TEMPERATURE_SERIES` | built-in list | comma-separated series tickers to monitor |
-| `BUY_CHANCE_CENTS` | `90` | exact chance (¢ = %) required to buy (legacy name: `BUY_YES_PRICE_CENTS`) |
+| `BUY_CHANCE_MIN_CENTS` | `90` | bottom of the buy band for the estimated chance (¢ = %) |
+| `BUY_CHANCE_MAX_CENTS` | `95` | top of the buy band (legacy `BUY_CHANCE_CENTS`/`BUY_YES_PRICE_CENTS` seed both) |
+| `MAX_SPREAD_CENTS` | `5` | ignore markets whose bid/ask spread is wider than this |
+| `CHANCE_SMOOTHING_SECONDS` | `30` | EWMA half-life for the microprice estimate |
 | `LIQUIDITY_EXIT_BUFFER` | `2.0` | sell when YES-bid depth ≤ this × position size |
 | `LIQUIDITY_POLL_SECONDS` | `5.0` | order-book depth poll cadence per held position |
 | `MIN_SELL_PRICE_CENTS` | `0` | stop-loss: sell if YES bid ≤ this (`0` = off; never fires on an empty book) |
@@ -150,7 +155,6 @@ All settings are environment variables (see `.env.example`). Highlights:
 | `POLL_INTERVAL_SECONDS` | `1.0` | decision-loop cadence |
 | `SCAN_INTERVAL_SECONDS` | `5.0` | REST market re-scan cadence |
 | `USE_WEBSOCKET` | `true` | realtime ticker updates |
-| `FORCE_SELL_BUFFER_SECONDS` | `60` | force-sell this long before close |
 | `MIN_SECONDS_TO_CLOSE` | `300` | don't enter markets closing this soon |
 | `KALSHI_ORDER_API` | `v2` | `v2` (current) or `legacy` order endpoint |
 
@@ -161,31 +165,34 @@ All settings are environment variables (see `.env.example`). Highlights:
 A few points in the spec needed a concrete reading; these are the choices made
 (all configurable):
 
-- **"Chance" = Kalshi's Chance column**: the last traded YES price (1¢ = 1%),
-  which is *not* necessarily the current YES ask — a market can show 11% chance
-  while YES asks 10¢. The bot triggers when the chance equals
-  `BUY_CHANCE_CENTS`, then places a limit buy at that same price (so it never
-  pays more than the displayed chance; if the ask is higher the order rests
-  until filled or `BUY_TIMEOUT_SECONDS` cancels it).
+- **"Chance" = an estimate of what the market genuinely believes**, not the
+  number Kalshi displays (that's just the last trade, which can be stale or
+  moved by a single contract). The estimate is the order book's depth-weighted
+  midpoint (Stoikov microprice — heavy bidding pressure pulls it toward the
+  ask), smoothed with an EWMA (`CHANCE_SMOOTHING_SECONDS` half-life), then
+  renormalized by the sum of the event's bucket midpoints, since mutually
+  exclusive buckets must truly sum to 100% (this strips the structural
+  overround / longshot bias). Markets whose spread exceeds `MAX_SPREAD_CENTS`
+  are skipped entirely — a wide book carries no probability information. The
+  entry order is a limit at the YES ask, capped at the top of the band, so the
+  bot never pays more than `BUY_CHANCE_MAX_CENTS`.
 - **Liquidity exit:** while holding, the bot polls the market's order book and
   sums the resting YES-bid quantity. When that depth falls to or below
   `LIQUIDITY_EXIT_BUFFER × position size`, it sells immediately — capturing the
   ride up while there is still enough liquidity left to actually fill the exit.
 - **"Portfolio" = available cash balance.** Since only one trade runs and it
   starts from cash, the cash balance equals portfolio value at entry.
-- **"Midnight / market close"** uses each market's actual `close_time` from the
-  API. The position is force-sold `FORCE_SELL_BUFFER_SECONDS` *before* that time
-  to guarantee the exit lands before the close.
-- **Force-sell mechanism:** a market order on the legacy API, or — since the v2
-  schema requires a price — an aggressive immediate-or-cancel sell at the 1¢
-  floor, which sweeps all resting bids (best price first) to flatten the
-  position.
-- **Entry order** is a good-till-canceled limit buy at 90¢, sized to 1/3 of the
-  portfolio; partial fills are kept and managed, and an unfilled order is
-  cancelled after `BUY_TIMEOUT_SECONDS`.
+- **Market close:** positions are deliberately carried through close and left
+  to settle; only the liquidity exit and the stop-loss ever sell.
+- **Force-sell mechanism** (used by those exits): a market order on the legacy
+  API, or — since the v2 schema requires a price — an aggressive
+  immediate-or-cancel sell at the 1¢ floor, which sweeps all resting bids
+  (best price first) to flatten the position.
+- **Entry order** is a good-till-canceled limit buy at the ask (capped at the
+  band max), sized to 1/3 of the portfolio; partial fills are kept and managed,
+  and an unfilled order is cancelled after `BUY_TIMEOUT_SECONDS`.
 - **Restart safety:** on startup (live mode) the bot adopts any existing YES
-  position and resumes managing it, preserving the one-trade and
-  no-position-through-close invariants.
+  position and resumes managing it across restarts.
 
 ## Project layout
 

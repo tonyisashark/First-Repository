@@ -79,6 +79,51 @@ def market_volume(market: dict) -> float:
     return 0.0
 
 
+def _orderbook_levels(orderbook: dict, side: str):
+    """Yield ``(price_cents, quantity)`` for one side of an orderbook payload.
+
+    Levels are ``[price, quantity]`` pairs under ``"yes"`` / ``"no"`` (legacy
+    integer cents) or ``"yes_dollars"`` / ``"no_dollars"`` (decimal strings).
+    """
+    levels = orderbook.get(f"{side}_dollars")
+    dollars = levels is not None
+    if levels is None:
+        levels = orderbook.get(side)
+    for level in levels or []:
+        try:
+            price = dollars_to_cents(level[0]) if dollars else int(round(float(level[0])))
+            qty = to_float(level[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if price is not None:
+            yield price, qty
+
+
+def orderbook_best_levels(orderbook: dict) -> dict:
+    """Best YES bid/ask price and quantity from an orderbook, in cents.
+
+    The book's ``yes`` side holds resting YES buys (bids). The YES *ask* side is
+    derived from resting NO buys: a NO bid at ``q`` cents is an offer to take
+    the other side of YES at ``100 - q``, so the best YES ask is ``100 - best
+    NO bid``. Returns ``{"bid": price|None, "bid_qty": float, "ask": price|None,
+    "ask_qty": float}``.
+    """
+    best_bid, bid_qty = None, 0.0
+    for price, qty in _orderbook_levels(orderbook, "yes"):
+        if best_bid is None or price > best_bid:
+            best_bid, bid_qty = price, qty
+    best_no, no_qty = None, 0.0
+    for price, qty in _orderbook_levels(orderbook, "no"):
+        if best_no is None or price > best_no:
+            best_no, no_qty = price, qty
+    return {
+        "bid": best_bid,
+        "bid_qty": bid_qty,
+        "ask": (100 - best_no) if best_no is not None else None,
+        "ask_qty": no_qty,
+    }
+
+
 def orderbook_bid_depth(orderbook: dict, side: str = "yes") -> float:
     """Total resting buy quantity on one side of an orderbook, in contracts.
 
@@ -87,18 +132,7 @@ def orderbook_bid_depth(orderbook: dict, side: str = "yes") -> float:
     ``"no_dollars"`` (decimal-string) keys.  The summed quantity is how many
     contracts could currently be sold into that side's bids.
     """
-    levels = orderbook.get(f"{side}_dollars")
-    if levels is None:
-        levels = orderbook.get(side)
-    if not levels:
-        return 0.0
-    total = 0.0
-    for level in levels:
-        try:
-            total += to_float(level[1])
-        except (IndexError, TypeError):
-            continue
-    return total
+    return sum(qty for _, qty in _orderbook_levels(orderbook, side))
 
 
 def position_contracts(position: dict) -> float:

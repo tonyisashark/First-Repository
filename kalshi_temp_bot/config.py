@@ -106,10 +106,17 @@ class Config:
     temperature_series: List[str] = field(default_factory=lambda: list(DEFAULT_TEMPERATURE_SERIES))
 
     # --- strategy parameters ---
-    # Buy when a market's chance is exactly this (cents; 1 cent = 1%). "Chance"
-    # is the percentage Kalshi displays per market: the last traded YES price,
-    # which is not necessarily the current YES ask.
-    buy_chance_cents: int = 90
+    # Buy when the *estimated* chance falls inside this band (cents; 1c = 1%).
+    # The estimate is an EWMA-smoothed, depth-weighted book midpoint
+    # (microprice), renormalized across the event's buckets -- a stabler read of
+    # "what the market believes" than the displayed last-trade chance.
+    buy_chance_min_cents: int = 90
+    buy_chance_max_cents: int = 95
+    # Reject markets whose bid/ask spread exceeds this -- a wide book carries no
+    # real probability information.
+    max_spread_cents: int = 5
+    # EWMA half-life for smoothing the microprice (seconds).
+    chance_smoothing_seconds: float = 30.0
     # Exit on liquidity, not price: force-sell while the book still has enough
     # bid depth to fill the position. Triggers when the total resting YES-bid
     # quantity falls to/below ``liquidity_exit_buffer x position size``.
@@ -131,7 +138,6 @@ class Config:
     poll_interval_seconds: float = 1.0     # how often the decision loop runs
     scan_interval_seconds: float = 5.0     # how often the market universe is re-fetched
     use_websocket: bool = True             # realtime price updates between REST scans
-    force_sell_buffer_seconds: int = 60    # force-exit this long before market close
     min_seconds_to_close: int = 300        # don't open a trade in a market closing this soon
     buy_timeout_seconds: int = 30          # cancel an unfilled entry order after this long
     heartbeat_interval_seconds: float = 30.0  # how often to log an "I'm alive" status line
@@ -170,8 +176,18 @@ class Config:
             dry_run=_get_bool("DRY_RUN", True),
             paper_balance_cents=_get_int("PAPER_BALANCE_CENTS", 1_000_00),
             temperature_series=series,
-            # BUY_YES_PRICE_CENTS is the legacy name for the same knob.
-            buy_chance_cents=_get_int("BUY_CHANCE_CENTS", _get_int("BUY_YES_PRICE_CENTS", 90)),
+            # BUY_CHANCE_CENTS / BUY_YES_PRICE_CENTS are legacy single-value
+            # names; when present they seed both ends of the band.
+            buy_chance_min_cents=_get_int(
+                "BUY_CHANCE_MIN_CENTS",
+                _get_int("BUY_CHANCE_CENTS", _get_int("BUY_YES_PRICE_CENTS", 90)),
+            ),
+            buy_chance_max_cents=_get_int(
+                "BUY_CHANCE_MAX_CENTS",
+                _get_int("BUY_CHANCE_CENTS", _get_int("BUY_YES_PRICE_CENTS", 95)),
+            ),
+            max_spread_cents=_get_int("MAX_SPREAD_CENTS", 5),
+            chance_smoothing_seconds=_get_float("CHANCE_SMOOTHING_SECONDS", 30.0),
             liquidity_exit_buffer=_get_float("LIQUIDITY_EXIT_BUFFER", 2.0),
             liquidity_poll_seconds=_get_float("LIQUIDITY_POLL_SECONDS", 5.0),
             min_sell_price_cents=_get_int("MIN_SELL_PRICE_CENTS", 0),
@@ -182,7 +198,6 @@ class Config:
             poll_interval_seconds=_get_float("POLL_INTERVAL_SECONDS", 1.0),
             scan_interval_seconds=_get_float("SCAN_INTERVAL_SECONDS", 5.0),
             use_websocket=_get_bool("USE_WEBSOCKET", True),
-            force_sell_buffer_seconds=_get_int("FORCE_SELL_BUFFER_SECONDS", 60),
             min_seconds_to_close=_get_int("MIN_SECONDS_TO_CLOSE", 300),
             buy_timeout_seconds=_get_int("BUY_TIMEOUT_SECONDS", 30),
             heartbeat_interval_seconds=_get_float("HEARTBEAT_INTERVAL_SECONDS", 30.0),
