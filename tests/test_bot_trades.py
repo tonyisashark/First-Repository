@@ -250,6 +250,27 @@ def test_position_rides_through_market_close():
     assert bot.trades[0].state is TradeState.HOLDING  # kept; settles on its own
 
 
+def test_paper_position_settles_after_market_leaves_the_scan():
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    a = edged_universe(bot)
+    bot.tick()
+
+    # A single missing scan (e.g. one failed series fetch) must not settle it...
+    set_markets(bot, [filler()])
+    bot.tick()
+    assert bot.trades[0].state is TradeState.HOLDING
+    set_markets(bot, [a, filler()])           # back in the scan -> counter resets
+    bot.tick()
+    assert bot.trades[0].missing_scans == 0
+
+    # ...but consistently gone means closed/settled: the paper position clears.
+    set_markets(bot, [filler()])
+    bot.tick()
+    bot.tick()
+    bot.tick()
+    assert bot.trades == []
+
+
 def test_does_not_enter_market_closing_too_soon():
     bot = make_bot(client=FakeBookClient(), max_positions=1)
     a = mv("A", close_in_s=60)                # closes in 60s < the 300s floor

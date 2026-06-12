@@ -115,6 +115,7 @@ class Trade:
     buy_placed_at: float = 0.0
     depth_checked_at: float = 0.0          # last order-book poll
     bid_depth: Optional[float] = None      # last observed exit-side depth
+    missing_scans: int = 0                 # consecutive scans without the market
 
 
 class TradingBot:
@@ -547,8 +548,18 @@ class TradingBot:
         if market is None:
             # Closed or temporarily missing from the scan: nothing actionable,
             # but drop the trade once settlement has flattened the position.
+            # (Several consecutive misses, so one failed series fetch doesn't
+            # count as a close.)
+            trade.missing_scans += 1
+            if self.cfg.dry_run and trade.missing_scans >= 3:
+                logger.info(
+                    "[PAPER] %s left the scan; treating the position as settled",
+                    trade.ticker,
+                )
+                return True
             logger.debug("%s not in the current scan; holding through to settlement", trade.ticker)
             return self._settled_flat(trade)
+        trade.missing_scans = 0
 
         # Poll this position's order book on a cadence; the same fetch feeds
         # the probability estimate and the liquidity measurement.
