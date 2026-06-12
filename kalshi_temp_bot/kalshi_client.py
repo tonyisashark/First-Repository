@@ -159,8 +159,13 @@ class KalshiClient:
         return self._request("GET", f"/markets/{ticker}").get("market", {})
 
     def get_orderbook(self, ticker: str) -> dict:
-        """Full resting-order book for one market: price levels per side."""
-        return self._request("GET", f"/markets/{ticker}/orderbook").get("orderbook", {}) or {}
+        """Full resting-order book for one market: price levels per side.
+
+        The fixed-point migration moved the payload to ``orderbook_fp`` (with
+        ``*_dollars`` decimal-string levels); older hosts still use ``orderbook``.
+        """
+        data = self._request("GET", f"/markets/{ticker}/orderbook")
+        return data.get("orderbook_fp") or data.get("orderbook") or {}
 
     # -- portfolio (auth) --------------------------------------------------
     def get_balance(self) -> dict:
