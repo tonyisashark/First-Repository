@@ -103,6 +103,40 @@ def test_renormalization_skipped_when_sum_is_implausible():
     assert est["ONLY"] == 50.0
 
 
+def test_renormalization_pins_rail_priced_buckets():
+    # A settled winner (99/100) in an event whose stale tails inflate the sum
+    # to ~105.5: proportional renormalization would tax the winner to ~94.3
+    # and manufacture a phantom +4.6c NO edge at the 1c NO ask. Rail-priced
+    # values are settlement certainty and must not be rescaled.
+    markets = [
+        mk("WIN", yes_bid=99, yes_ask=100),
+        mk("T1", yes_bid=1, yes_ask=3),
+        mk("T2", yes_bid=1, yes_ask=3),
+        mk("T3", yes_bid=1, yes_ask=3),
+    ]
+    est = renormalized_estimates(markets, {"WIN": 99.5})
+    assert est["WIN"] == 99.0  # pinned (and clamped), not scaled down
+    no = evaluate_side(markets[0], "no", est["WIN"], 1 / 3)
+    assert no.edge_cents < 0   # no phantom NO edge on the settled winner
+
+
+def test_idle_summary_skips_rail_priced_markets():
+    # A settled overnight event (winner at 99 with stale tails) sits next to a
+    # live one. Without the rail pin+skip the winner would show a phantom
+    # "+4.6c NO edge" as the closest; the genuine live market must win instead.
+    markets = [
+        mk("WIN", event="DONE", yes_bid=99, yes_ask=100),
+        mk("T1", event="DONE", yes_bid=1, yes_ask=3),
+        mk("T2", event="DONE", yes_bid=1, yes_ask=3),
+        mk("T3", event="DONE", yes_bid=1, yes_ask=3),
+        mk("MID", event="LIVE", yes_bid=92, yes_ask=94),
+        mk("Z", event="LIVE", yes_bid=5, yes_ask=7),
+    ]
+    text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
+    assert "WIN" not in text
+    assert "closest: MID" in text
+
+
 def test_renormalization_ignores_uninformative_mids():
     # The wide-spread bucket would poison the event sum; it must not count.
     markets = [

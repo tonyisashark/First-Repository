@@ -49,6 +49,8 @@ from .strategy import (
     LEVEL_DECAY_CENTS,
     MAX_INFORMATIVE_SPREAD_CENTS,
     MIN_EDGE_CENTS,
+    RAIL_MAX_CENTS,
+    RAIL_MIN_CENTS,
     MarketView,
     TradeCandidate,
     best_candidate,
@@ -361,7 +363,7 @@ class TradingBot:
             if estimate is None:
                 continue
             mid = mids.get(market.ticker)
-            if mid is None or not (3.0 <= mid <= 97.0):
+            if mid is None or not (RAIL_MIN_CENTS <= mid <= RAIL_MAX_CENTS):
                 # Rail-priced (settled-in-all-but-name) buckets: their NO side
                 # always *looks* near-edge on the mid but can never clear the
                 # bar net of fees -- don't let them crowd the fetch queue.

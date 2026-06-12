@@ -54,6 +54,12 @@ MAX_INFORMATIVE_SPREAD_CENTS = 20
 # (buckets missing from the scan), so the raw estimate is safer.
 RENORM_SUM_MIN = 80.0
 RENORM_SUM_MAX = 125.0
+# A bucket priced at the rails is settlement certainty, not market opinion:
+# its probability is pinned, so renormalization must not rescale it (taxing a
+# ~99.5c settled winner for the event's stale tail quotes would manufacture a
+# phantom NO edge), and such markets carry nothing tradeable for a taker.
+RAIL_MIN_CENTS = 3.0
+RAIL_MAX_CENTS = 97.0
 # Order-book level weighting: a level's quantity counts at half weight for
 # every 3 cents it sits away from the best price (the touch dominates, depth
 # behind it still matters).
@@ -186,7 +192,7 @@ def renormalized_estimates(
         if value is None:
             continue
         total = sums.get(market.event_ticker, 0.0)
-        if RENORM_SUM_MIN <= total <= RENORM_SUM_MAX:
+        if RENORM_SUM_MIN <= total <= RENORM_SUM_MAX and RAIL_MIN_CENTS < value < RAIL_MAX_CENTS:
             value = value * 100.0 / total
         final[market.ticker] = min(99.0, max(1.0, value))
     return final
@@ -371,6 +377,9 @@ def idle_watch_summary(
         estimate = merged.get(market.ticker)
         if estimate is None:
             continue
+        mid = mid_price_cents(market)
+        if mid is None or not (RAIL_MIN_CENTS <= mid <= RAIL_MAX_CENTS):
+            continue  # effectively settled: nothing a taker could trade
         for side in ("yes", "no"):
             cand = evaluate_side(market, side, estimate, portfolio_fraction)
             if cand is not None and (near is None or cand.edge_cents > near.edge_cents):
