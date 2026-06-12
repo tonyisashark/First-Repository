@@ -1,52 +1,52 @@
-"""Unit tests for unit/money conversion helpers."""
-
-from kalshi_temp_bot import money
-
-
-def test_dollars_to_cents():
-    assert money.dollars_to_cents("0.90") == 90
-    assert money.dollars_to_cents("0.99") == 99
-    assert money.dollars_to_cents("0.01") == 1
-    assert money.dollars_to_cents(None) is None
-
-
-def test_cents_to_dollars_str():
-    assert money.cents_to_dollars_str(90) == "0.90"
-    assert money.cents_to_dollars_str(99) == "0.99"
-    assert money.cents_to_dollars_str(1) == "0.01"
+from kalshi_bot.money import (
+    cents,
+    count_to_fp,
+    field_count,
+    field_micro,
+    fp_to_count,
+    micro_to_usd_str,
+    usd_to_micro,
+)
 
 
-def test_fixed_point_str():
-    assert money.fixed_point_str(10) == "10.00"
-    assert money.fixed_point_str(111) == "111.00"
+def test_usd_round_trip():
+    assert usd_to_micro("0.56") == 560_000
+    assert usd_to_micro("0.5600") == 560_000
+    assert usd_to_micro("1") == 1_000_000
+    assert usd_to_micro("0.005") == 5_000
+    assert usd_to_micro(None) is None
+    assert usd_to_micro("garbage") is None
 
 
-def test_market_price_cents_prefers_dollars_field():
-    market = {"yes_ask_dollars": "0.90", "yes_ask": 12}
-    assert money.market_price_cents(market, "yes_ask") == 90
+def test_micro_to_usd_str():
+    assert micro_to_usd_str(560_000) == "0.56"
+    assert micro_to_usd_str(1_000_000) == "1.00"
+    assert micro_to_usd_str(5_000) == "0.005"
+    assert micro_to_usd_str(0) == "0.00"
+    assert micro_to_usd_str(990_000) == "0.99"
+    # values that fit the 6-decimal wire format survive a round trip
+    assert usd_to_micro(micro_to_usd_str(123_456)) == 123_456
 
 
-def test_market_price_cents_legacy_cents_fallback():
-    market = {"yes_ask": 90}
-    assert money.market_price_cents(market, "yes_ask") == 90
+def test_cents_helper():
+    assert cents(90) == 900_000
+    assert cents(0.6) == 6_000
 
 
-def test_market_price_cents_missing():
-    assert money.market_price_cents({}, "yes_ask") is None
+def test_counts():
+    assert fp_to_count("10.00") == 10
+    assert fp_to_count("-10.00") == -10
+    assert fp_to_count("10.99") == 10          # truncate toward zero
+    assert fp_to_count("-10.99") == -10
+    assert fp_to_count(None) == 0
+    assert count_to_fp(7) == "7.00"
 
 
-def test_market_volume():
-    assert money.market_volume({"volume_fp": "33896.00"}) == 33896.0
-    assert money.market_volume({"volume": 100}) == 100.0
-    assert money.market_volume({}) == 0.0
-
-
-def test_position_contracts_signed():
-    assert money.position_contracts({"position_fp": "10.00"}) == 10.0
-    assert money.position_contracts({"position": -5}) == -5.0
-
-
-def test_balance_cents():
-    assert money.balance_cents({"balance": 30000}) == 30000
-    assert money.balance_cents({"balance_dollars": "300.00"}) == 30000
-    assert money.balance_cents({}) == 0
+def test_field_readers_prefer_modern_variants():
+    payload = {"yes_bid_dollars": "0.41", "yes_bid": 99, "volume_fp": "12.00", "volume": 5}
+    assert field_micro(payload, "yes_bid") == 410_000
+    assert field_count(payload, "volume") == 12
+    legacy = {"yes_bid": 41, "volume": 12}
+    assert field_micro(legacy, "yes_bid") == 410_000
+    assert field_count(legacy, "volume") == 12
+    assert field_micro({}, "yes_bid") is None

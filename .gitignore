@@ -1,21 +1,19 @@
-# Secrets / credentials -- never commit these
+# secrets & local config
 .env
 *.pem
 *.key
 
-# Python
+# runtime state
+state/
+*.sqlite3
+*.log
+
+# python
 __pycache__/
-*.py[cod]
+*.pyc
 *.egg-info/
+build/
+dist/
 .pytest_cache/
 .venv/
 venv/
-env/
-build/
-dist/
-installer/Output/
-
-# Editors / OS
-.vscode/
-.idea/
-.DS_Store
