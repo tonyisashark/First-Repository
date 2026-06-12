@@ -155,15 +155,43 @@ def test_maker_entry_rests_inside_the_spread():
     assert bot._paper_balance == pytest.approx(300_00 - 41.0 * bot.trades[0].count)
 
 
-def test_maker_entry_times_out_and_is_repriced_next_tick():
+def test_correctly_priced_resting_bid_is_left_to_work():
+    # Cancelling a bid that is already at the right level only to repost it
+    # would lose queue position (live) and spam the log: the expired timer
+    # just re-arms while the level stays right.
     bot = make_bot(client=FakeBookClient(), max_positions=1)
     wide_maker_universe(bot)
-    bot.maker_buy_timeout = 0.0                    # expire immediately
+    bot.maker_buy_timeout = 0.0                    # expire every tick
     bot.tick()
-    assert bot.trades and bot.trades[0].maker      # posted this tick
-    bot.tick()                                     # timed out, unfilled -> cancelled
-    # ... and immediately re-posted at the fresh price (no cooldown).
-    assert bot.trades and bot.trades[0].state is TradeState.BUYING
+    first = bot.trades[0]
+    bot.tick()
+    bot.tick()
+    assert bot.trades[0] is first                  # same order, never churned
+    assert first.buy_price == 41
+
+
+def test_resting_bid_reprices_when_the_book_moves():
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    a = wide_maker_universe(bot)
+    bot.maker_buy_timeout = 0.0
+    bot.tick()
+    assert bot.trades[0].buy_price == 41
+    a.yes_bid = 44                                 # bid moved up underneath us
+    bot.tick()                                     # off-level -> cancel + repost
+    assert bot.trades[0].buy_price == 45           # fresh bid one tick inside
+
+
+def test_maker_bid_fills_when_a_trade_prints_at_its_level():
+    # A print at/below the resting level means a seller crossed down to it:
+    # paper mode must credit the fill even though the quotes never moved.
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    a = wide_maker_universe(bot)
+    bot.tick()
+    assert bot.trades[0].buy_price == 41
+    a.last_price, a.volume = 41, a.volume + 10
+    bot.tick()
+    assert bot.trades[0].state is TradeState.HOLDING
+    assert bot.trades[0].cost_cents == 41.0        # maker: fee-free
 
 
 def test_resting_bid_is_pulled_when_the_estimate_collapses():

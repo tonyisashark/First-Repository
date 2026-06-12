@@ -150,6 +150,7 @@ class Trade:
     cost_cents: float = 0.0                # all-in entry cost per contract (set on fill)
     exit_offer_price: Optional[int] = None # resting take-profit offer level
     exit_offer_at: float = 0.0
+    posted_volume: Optional[float] = None  # market volume when the bid was posted
     last_mark_cents: Optional[float] = None  # latest sellable value (bid - fee)
     depth_checked_at: float = 0.0          # last order-book poll
     bid_depth: Optional[float] = None      # last observed exit-side depth
@@ -630,7 +631,7 @@ class TradingBot:
         trade = Trade(
             ticker=cand.market.ticker, side=cand.side, count=count,
             buy_price=cand.price_cents, event=cand.market.event_ticker,
-            maker=maker,
+            maker=maker, posted_volume=cand.market.volume,
         )
 
         if self.cfg.dry_run:
@@ -743,19 +744,34 @@ class TradingBot:
                     return True
 
         if self.cfg.dry_run:
-            # Paper maker fill: the market trading down through the resting
-            # bid is the only fill observable from quotes alone. This is the
-            # pessimistic (purely adversely-selected) case -- real fills also
-            # come from uninformed sellers hitting the bid -- so paper results
-            # UNDERSTATE the maker path rather than flattering it.
-            ask = self._side_ask(self._market_for(markets, trade.ticker), trade.side)
-            if ask is not None and trade.buy_price is not None and ask <= trade.buy_price:
-                self._paper_fill_entry(trade)
-                return False
+            # Paper maker fills, observable from quotes/prints alone: the ask
+            # moving down through the resting bid, or a trade printing at or
+            # below its level (a seller crossed down to it). Both understate
+            # the real fill rate -- fills also come from uninformed sellers
+            # hitting a bid the market never trades through -- so paper
+            # results UNDERSTATE the maker path rather than flattering it.
+            market = self._market_for(markets, trade.ticker)
+            if trade.buy_price is not None and market is not None:
+                ask = self._side_ask(market, trade.side)
+                if ask is not None and ask <= trade.buy_price:
+                    self._paper_fill_entry(trade)
+                    return False
+                if (
+                    market.last_price is not None
+                    and trade.posted_volume is not None
+                    and market.volume > trade.posted_volume
+                ):
+                    last = market.last_price if trade.side == "yes" else 100 - market.last_price
+                    if last <= trade.buy_price:
+                        self._paper_fill_entry(trade)
+                        return False
             if timed_out:
+                if trade.maker and self._resting_at_right_level(trade, markets):
+                    trade.buy_placed_at = time.time()  # nothing to fix: keep working
+                    return False
                 logger.info(
-                    "[PAPER] resting bid %s %s @ %sc did not fill within %ss; cancelled",
-                    trade.ticker, trade.side.upper(), trade.buy_price, timeout,
+                    "[PAPER] resting bid %s %s @ %sc is off the best level; repricing",
+                    trade.ticker, trade.side.upper(), trade.buy_price,
                 )
                 return True
             return False
@@ -777,10 +793,29 @@ class TradingBot:
             self._begin_holding(trade)
             return False
         if timed_out:
+            if trade.maker and self._resting_at_right_level(trade, markets):
+                # Cancelling a correctly-priced bid only to repost it would
+                # throw away queue position: leave it to work.
+                trade.buy_placed_at = time.time()
+                return False
             logger.info("Buy for %s did not fill within %ss; cancelling", trade.ticker, timeout)
             self._cancel(trade.buy_order)
             return True
         return False
+
+    def _resting_at_right_level(self, trade: Trade, markets: List[MarketView]) -> bool:
+        """True when a resting maker bid is already where a fresh one would
+        go: one tick above the next-best bid -- or it IS the best bid (live
+        mode, where the quote reflects our own order) -- and still below the
+        ask. Anything else warrants a cancel-and-repost at the new level."""
+        market = self._market_for(markets, trade.ticker)
+        bid = self._side_bid(market, trade.side)
+        ask = self._side_ask(market, trade.side)
+        if bid is None or ask is None or trade.buy_price is None:
+            return False
+        if trade.buy_price >= ask:
+            return False
+        return trade.buy_price in (bid, bid + 1)
 
     def _trade_manage_holding(self, trade: Trade, markets: List[MarketView]) -> bool:
         # The preferred exit is the take-profit harvest (sell once the market
