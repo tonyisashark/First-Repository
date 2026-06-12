@@ -42,6 +42,8 @@ def make_bot(client=None, **overrides):
     bot.ewma_half_life = 0.0          # no smoothing lag in tests
     bot.min_estimate_history = 0.0    # no estimate-maturity wait in tests
     bot.min_estimate_samples = 0
+    bot.startup_warmup = 0.0          # no board-warmup wait in tests
+    bot.entry_spacing = 0.0           # no pacing between entries in tests
     return bot
 
 
@@ -226,6 +228,34 @@ def test_taker_edge_preempts_a_resting_maker_bid():
     assert [(t.ticker, t.maker, t.state) for t in bot.trades] == [
         ("B", False, TradeState.HOLDING)
     ]
+
+
+def test_startup_warmup_blocks_immediate_entries():
+    # Right after starting, per-ticker estimates can be "mature" while the
+    # board-wide renormalization picture is still half-built -- the bot must
+    # watch before it trades.
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    bot.startup_warmup = 10_000
+    edged_universe(bot)
+    bot.tick()
+    assert bot.trades == []
+
+
+def test_entries_are_paced_not_burst():
+    # Two genuine-looking edges in different events: deploy into ONE, then
+    # wait out the spacing window before committing the next slice. A burst
+    # of simultaneous edges is the signature of a systematic estimate error.
+    bot = make_bot(client=FakeBookClient(), max_positions=3)
+    bot.entry_spacing = 10_000
+    a = mv("A")
+    b = mv("B", event="E2")
+    bot.client.books["A"] = edge_book()
+    bot.client.books["B"] = edge_book()
+    set_markets(bot, [a, filler(), b, filler("E2")])
+    bot.tick()
+    assert len(bot.trades) == 1
+    bot.tick()                                     # still inside the window
+    assert len(bot.trades) == 1
 
 
 def test_no_orderbook_capability_means_no_trades():

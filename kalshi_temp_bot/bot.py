@@ -98,6 +98,15 @@ TAKE_PROFIT_REMAINING_CENTS = 1.0  # holding must add less than this
 # means either its liquidity is draining or the model and the market disagree
 # sharply -- flipping straight back in would just churn fees on noise.
 REENTRY_COOLDOWN_SECONDS = 300.0
+# No entries until the estimator has watched the board for a full warmup:
+# per-ticker maturity gates exist, but renormalization quality is board-wide
+# and the first minute after startup sees it at its worst.
+STARTUP_WARMUP_SECONDS = 90.0
+# New entries are paced. Several "edges" appearing at once is more often one
+# systematic estimate error than several independent opportunities, and
+# spacing the deployments lets each one be confirmed (or repriced away)
+# before the next slice of bankroll is committed.
+ENTRY_SPACING_SECONDS = 30.0
 
 # Seconds to wait between successive per-series market requests during a scan,
 # so a multi-city scan doesn't burst past Kalshi's rate limit.
@@ -182,6 +191,8 @@ class TradingBot:
         self.buy_timeout = BUY_TIMEOUT_SECONDS
         self.maker_buy_timeout = MAKER_BUY_TIMEOUT_SECONDS
         self.exit_offer_timeout = EXIT_OFFER_TIMEOUT_SECONDS
+        self.startup_warmup = STARTUP_WARMUP_SECONDS
+        self.entry_spacing = ENTRY_SPACING_SECONDS
         self.ewma_half_life = EWMA_HALF_LIFE_SECONDS
         self.min_estimate_history = MIN_ESTIMATE_HISTORY_SECONDS
         self.min_estimate_samples = MIN_ESTIMATE_SAMPLES
@@ -189,6 +200,8 @@ class TradingBot:
         self._market_cache: List[MarketView] = []
         self._last_scan: float = 0.0
         self._scanned_this_tick: bool = False
+        self._started_at: float = time.time()
+        self._last_entry_at: float = 0.0
         self._last_heartbeat: float = 0.0
         self._current_tickers: List[str] = []
         self._running = False
@@ -523,6 +536,11 @@ class TradingBot:
 
     # -- entry ---------------------------------------------------------------
     def _maybe_enter(self, markets: List[MarketView]) -> None:
+        now = time.time()
+        if (now - self._started_at) < self.startup_warmup:
+            return
+        if (now - self._last_entry_at) < self.entry_spacing:
+            return
         free = self.cfg.max_positions - self._occupied_slots(markets)
         pending_makers = [
             t for t in self.trades if t.state is TradeState.BUYING and t.maker
@@ -620,6 +638,7 @@ class TradingBot:
         return min(count, entry_depth, exit_depth)
 
     def _open_trade(self, cand: TradeCandidate, count: float, balance: int, maker: bool = False) -> None:
+        self._last_entry_at = time.time()
         logger.info(
             "ENTER %s %s %s | est %.1f%% vs cost %.1fc (edge %+.1fc, growth %+.4f) | "
             "buying %g @ %dc (%.0f%% of %sc balance)",
@@ -721,8 +740,16 @@ class TradingBot:
         return max(0.0, held)
 
     def _trade_check_buy(self, trade: Trade, markets: List[MarketView]) -> bool:
+        now = time.time()
         timeout = self.maker_buy_timeout if trade.maker else self.buy_timeout
-        timed_out = (time.time() - trade.buy_placed_at) >= timeout
+        timed_out = (now - trade.buy_placed_at) >= timeout
+
+        # Keep the resting market's book fresh: it feeds both the estimate
+        # (so a collapse cancels the bid promptly) and the right-level check
+        # (so quote staleness can't cause cancel/repost churn).
+        if trade.maker and (now - trade.depth_checked_at) >= self.book_poll_seconds:
+            trade.depth_checked_at = now
+            self._fetch_book(trade.ticker, now)
 
         # An unfilled bid whose justification has evaporated must not sit in
         # the book waiting to be picked off by the very move it failed to see:
@@ -807,15 +834,34 @@ class TradingBot:
         """True when a resting maker bid is already where a fresh one would
         go: one tick above the next-best bid -- or it IS the best bid (live
         mode, where the quote reflects our own order) -- and still below the
-        ask. Anything else warrants a cancel-and-repost at the new level."""
+        ask. Anything else warrants a cancel-and-repost at the new level.
+
+        Both the scan/WS quote and a freshly-fetched book are consulted:
+        either source confirming the level keeps the order resting, so one
+        stale feed can't churn a correctly-priced bid out of the queue."""
+        if trade.buy_price is None:
+            return False
+        views = []
         market = self._market_for(markets, trade.ticker)
-        bid = self._side_bid(market, trade.side)
-        ask = self._side_ask(market, trade.side)
-        if bid is None or ask is None or trade.buy_price is None:
-            return False
-        if trade.buy_price >= ask:
-            return False
-        return trade.buy_price in (bid, bid + 1)
+        if market is not None:
+            views.append((self._side_bid(market, trade.side), self._side_ask(market, trade.side)))
+        cached = self._book_cache.get(trade.ticker)
+        if cached is not None and (time.time() - cached[1]) <= 2 * self.book_poll_seconds:
+            summary = cached[0]
+            yes_bid, yes_ask = summary["bid"], summary["ask"]
+            if trade.side == "yes":
+                views.append((yes_bid, yes_ask))
+            else:
+                views.append((
+                    100 - yes_ask if yes_ask is not None else None,
+                    100 - yes_bid if yes_bid is not None else None,
+                ))
+        for bid, ask in views:
+            if bid is None or ask is None:
+                continue
+            if trade.buy_price < ask and trade.buy_price in (bid, bid + 1):
+                return True
+        return False
 
     def _trade_manage_holding(self, trade: Trade, markets: List[MarketView]) -> bool:
         # The preferred exit is the take-profit harvest (sell once the market
