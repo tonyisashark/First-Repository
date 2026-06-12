@@ -19,6 +19,15 @@ def test_cents_to_dollars_str():
 def test_fixed_point_str():
     assert money.fixed_point_str(10) == "10.00"
     assert money.fixed_point_str(111) == "111.00"
+    assert money.fixed_point_str(2.5) == "2.50"     # fractional contracts
+    assert money.fixed_point_str(108.69) == "108.69"
+
+
+def test_floor_contracts():
+    assert money.floor_contracts(108.699) == 108.69     # 0.01 granularity
+    assert money.floor_contracts(0.29) == 0.29          # no float-wobble flooring
+    assert money.floor_contracts(108.69, fractional=False) == 108.0
+    assert money.floor_contracts(0.9, fractional=False) == 0.0
 
 
 def test_market_price_cents_prefers_dollars_field():

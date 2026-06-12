@@ -364,7 +364,7 @@ class BotGUI:
             if not trades:
                 self.status_vars["position"].set("none")
             else:
-                shown = ", ".join(f"{t.ticker} {t.side.upper()} x{t.count}" for t in trades[:2])
+                shown = ", ".join(f"{t.ticker} {t.side.upper()} x{t.count:g}" for t in trades[:2])
                 if len(trades) > 2:
                     shown += f" +{len(trades) - 2}"
                 self.status_vars["position"].set(

@@ -102,7 +102,7 @@ class Trade:
 
     ticker: str
     side: str                              # "yes" or "no"
-    count: int
+    count: float                           # contracts (0.01 granularity on v2)
     buy_price: Optional[int]               # in the side's own terms
     state: TradeState = TradeState.BUYING
     buy_order: Optional[dict] = None
@@ -218,7 +218,7 @@ class TradingBot:
             bid_txt = f"{bid}c" if bid is not None else "?"
             depth_txt = f" depth {trade.bid_depth:.0f}" if trade.bid_depth is not None else ""
             briefs.append(
-                f"{trade.ticker} {trade.side.upper()} x{trade.count} {trade.state.value} bid {bid_txt}{depth_txt}"
+                f"{trade.ticker} {trade.side.upper()} x{trade.count:g} {trade.state.value} bid {bid_txt}{depth_txt}"
             )
         more = f" +{len(self.trades) - 3} more" if len(self.trades) > 3 else ""
         return f"{watch} | {head} [{'; '.join(briefs)}{more}]"
@@ -400,10 +400,13 @@ class TradingBot:
         if best is None:
             return
 
+        # Fractional (0.01-contract) sizing deploys the budget almost exactly;
+        # the legacy order schema only takes whole contracts.
+        fractional = self.cfg.order_api != "legacy"
         balance = self._budget_balance_cents()
-        count = position_size(balance, best.fraction, best.price_cents)
-        count = self._cap_by_book_depth(best, count)
-        if count < 1:
+        count = position_size(balance, best.fraction, best.price_cents, fractional=fractional)
+        count = money.floor_contracts(self._cap_by_book_depth(best, count), fractional)
+        if count < (0.01 if fractional else 1):
             logger.info(
                 "Candidate %s %s found but size is 0 (balance %sc, book too thin)",
                 best.market.ticker, best.side.upper(), balance,
@@ -411,7 +414,7 @@ class TradingBot:
             return
         self._open_trade(best, count, balance)
 
-    def _cap_by_book_depth(self, cand: TradeCandidate, count: int) -> int:
+    def _cap_by_book_depth(self, cand: TradeCandidate, count: float) -> float:
         """Never size beyond what the book can fill -- entry fills against one
         side's resting orders and the eventual exit needs the other side."""
         cached = self._book_cache.get(cand.market.ticker)
@@ -422,12 +425,12 @@ class TradingBot:
             entry_depth, exit_depth = summary["no_total"], summary["yes_total"]
         else:
             entry_depth, exit_depth = summary["yes_total"], summary["no_total"]
-        return min(count, int(entry_depth), int(exit_depth))
+        return min(count, entry_depth, exit_depth)
 
-    def _open_trade(self, cand: TradeCandidate, count: int, balance: int) -> None:
+    def _open_trade(self, cand: TradeCandidate, count: float, balance: int) -> None:
         logger.info(
             "ENTER %s %s | est %.1f%% vs cost %.1fc (edge %+.1fc, growth %+.4f) | "
-            "buying %d @ %dc (%.0f%% of %sc balance)",
+            "buying %g @ %dc (%.0f%% of %sc balance)",
             cand.market.ticker, cand.side.upper(), cand.chance_cents, cand.cost_cents,
             cand.edge_cents, cand.growth, count, cand.price_cents,
             cand.fraction * 100, balance,
@@ -438,7 +441,7 @@ class TradingBot:
 
         if self.cfg.dry_run:
             logger.info(
-                "[PAPER] filled buy %d %s %s @ %dc",
+                "[PAPER] filled buy %g %s %s @ %dc",
                 count, cand.market.ticker, cand.side.upper(), cand.price_cents,
             )
             self._begin_holding(trade)
@@ -457,7 +460,7 @@ class TradingBot:
 
     def _begin_holding(self, trade: Trade) -> None:
         logger.info(
-            "Holding %d %s %s; exits: depth <= %.1fx position, edge reversal >= %.0fc, else settle",
+            "Holding %g %s %s; exits: depth <= %.1fx position, edge reversal >= %.0fc, else settle",
             trade.count, trade.ticker, trade.side.upper(),
             LIQUIDITY_EXIT_BUFFER, EXIT_EDGE_CENTS,
         )
@@ -475,30 +478,30 @@ class TradingBot:
             return self._trade_check_exit(trade, markets)
         return False
 
-    def _held_for(self, trade: Trade) -> int:
+    def _held_for(self, trade: Trade) -> float:
         """Contracts currently held for this trade's side (live mode).
 
         Kalshi reports a signed position: positive = YES, negative = NO.
         """
         signed = float(self.client.get_position_contracts(trade.ticker))
         held = signed if trade.side == "yes" else -signed
-        return max(0, int(held))
+        return max(0.0, held)
 
     def _trade_check_buy(self, trade: Trade) -> bool:
         held = self._held_for(trade)
         timed_out = (time.time() - trade.buy_placed_at) >= self.buy_timeout
 
-        if held >= trade.count:
+        if held >= trade.count - 0.005:  # full fill (within fixed-point rounding)
             trade.buy_order = None
-            logger.info("Buy fully filled %d %s %s; entering HOLDING", held, trade.ticker, trade.side.upper())
+            logger.info("Buy fully filled %g %s %s; entering HOLDING", held, trade.ticker, trade.side.upper())
             self._begin_holding(trade)
             return False
-        if held >= 1 and timed_out:
+        if held > 0 and timed_out:
             # Lock in whatever filled and stop trying to acquire more.
             self._cancel(trade.buy_order)
             trade.buy_order = None
             trade.count = held
-            logger.info("Buy filled %d %s %s; entering HOLDING", held, trade.ticker, trade.side.upper())
+            logger.info("Buy filled %g %s %s; entering HOLDING", held, trade.ticker, trade.side.upper())
             self._begin_holding(trade)
             return False
         if timed_out:
@@ -533,7 +536,7 @@ class TradingBot:
         #    is unsellable -- hold quietly instead of spamming doomed orders.
         if depth is not None and 0 < depth <= trade.count * LIQUIDITY_EXIT_BUFFER:
             logger.info(
-                "%s %s depth %.0f <= %.1fx position (%d) -- selling before liquidity runs out",
+                "%s %s depth %.0f <= %.1fx position (%g) -- selling before liquidity runs out",
                 trade.ticker, trade.side.upper(), depth, LIQUIDITY_EXIT_BUFFER, trade.count,
             )
             return self._force_exit(trade, "liquidity")
@@ -586,7 +589,7 @@ class TradingBot:
             ticker=trade.ticker, is_buy=False, count=trade.count,
             market_order=True, side=trade.side,
         )
-        logger.info("Force-sell submitted for %d %s %s (%s)", trade.count, trade.ticker, trade.side.upper(), reason)
+        logger.info("Force-sell submitted for %g %s %s (%s)", trade.count, trade.ticker, trade.side.upper(), reason)
         trade.state = TradeState.EXITING
         return False
 
@@ -599,9 +602,9 @@ class TradingBot:
         # only while there is a bid to sell into; selling into an empty book
         # just fails, so wait quietly for liquidity to return instead.
         if not self._has_exit_liquidity(trade, markets):
-            logger.debug("%s still holds %d but the book is empty; waiting for bids", trade.ticker, held)
+            logger.debug("%s still holds %g but the book is empty; waiting for bids", trade.ticker, held)
             return False
-        logger.warning("%s still holds %d after force-sell; re-sweeping", trade.ticker, held)
+        logger.warning("%s still holds %g after force-sell; re-sweeping", trade.ticker, held)
         trade.exit_order = self.client.create_order(
             ticker=trade.ticker, is_buy=False, count=held,
             market_order=True, side=trade.side,
@@ -669,9 +672,9 @@ class TradingBot:
             if signed == 0:
                 continue
             side = "yes" if signed > 0 else "no"
-            count = int(abs(signed))
+            count = money.floor_contracts(abs(signed))
             ticker = pos.get("ticker", "")
-            logger.info("Adopting existing position %s %s x%d; resuming HOLDING", ticker, side.upper(), count)
+            logger.info("Adopting existing position %s %s x%g; resuming HOLDING", ticker, side.upper(), count)
             trade = Trade(ticker=ticker, side=side, count=count, buy_price=None)
             self._begin_holding(trade)
             self.trades.append(trade)

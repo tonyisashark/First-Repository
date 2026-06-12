@@ -92,8 +92,9 @@ def test_enters_underpriced_yes_at_the_ask():
     trade = bot.trades[0]
     assert (trade.ticker, trade.side, trade.state) == ("A", "yes", TradeState.HOLDING)
     assert trade.buy_price == 92          # taker at the ask, never above it
-    # 1/3 of $300 = 9999c -> 108 contracts at 92c (Kelly ~0.58 doesn't bind).
-    assert trade.count == 108
+    # Fractional sizing deploys 1/3 of $300 almost exactly: $100/0.92 = 108.69
+    # contracts (Kelly ~0.58 doesn't bind). 0.01-contract granularity.
+    assert trade.count == pytest.approx(108.69)
 
 
 def test_enters_no_side_when_yes_is_overpriced():
@@ -111,7 +112,8 @@ def test_enters_no_side_when_yes_is_overpriced():
     assert (trade.ticker, trade.side) == ("A", "no")
     assert trade.buy_price == 45          # NO ask = 100 - yes_bid
     # Thin edge -> the Kelly cap (~9.4%), not the 1/3 ceiling, sizes the trade.
-    assert trade.count == int(300_00 * 0.09371) // 45 == 62
+    assert 62 <= trade.count < 63
+    assert trade.count == round(trade.count, 2)  # 0.01-contract granularity
 
 
 def test_size_is_capped_by_entry_side_book_depth():

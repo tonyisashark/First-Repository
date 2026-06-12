@@ -302,16 +302,24 @@ def best_candidate(candidates: List[TradeCandidate]) -> Optional[TradeCandidate]
     return max(candidates, key=lambda c: c.growth)
 
 
-def position_size(balance_cents: int, fraction: float, price_cents: int) -> int:
-    """Number of contracts affordable with ``fraction`` of the balance.
+def position_size(
+    balance_cents: int,
+    fraction: float,
+    price_cents: int,
+    fractional: bool = True,
+) -> float:
+    """Contracts affordable with ``fraction`` of the balance.
 
-    ``floor( (balance * fraction) / price )`` -- e.g. $300 balance, 1/3, 90c
-    -> floor(10000 / 90) = 111 contracts.
+    With ``fractional`` (Kalshi's fixed-point contracts, 0.01 granularity) the
+    budget is deployed almost exactly -- e.g. $300 balance, 1/3, 90c ->
+    111.11 contracts ($99.999). Without it, whole contracts: floor -> 111.
     """
     if price_cents <= 0:
-        return 0
-    budget_cents = int(balance_cents * fraction)
-    return budget_cents // price_cents
+        return 0.0
+    raw = (balance_cents * fraction) / price_cents
+    if fractional:
+        return int(raw * 100 + 1e-9) / 100.0
+    return float(int(raw + 1e-9))
 
 
 def idle_watch_summary(

@@ -18,7 +18,10 @@ there are no strategy knobs to configure.
   log-growth of the bankroll**, and the single best one is bought.
 - **Size:** the configured bankroll fraction (default **1/3**), automatically
   **capped at the trade's Kelly fraction** (thin edges deploy less) and by the
-  order book's visible depth on both the entry and exit sides.
+  order book's visible depth on both the entry and exit sides. Sizing uses
+  Kalshi's **fractional contracts (0.01 granularity)**, so the dollar budget is
+  deployed almost exactly; markets without fractional trading enabled fall
+  back to whole contracts automatically.
 - **Exit:** two self-tuning rules — **liquidity** (sell right before the exit
   side's resting depth runs out: depth ≤ 2× position) and **edge reversal**
   (sell when the market's bid overprices the held side by ≥ 3¢ net of the exit

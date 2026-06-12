@@ -49,9 +49,25 @@ def cents_to_dollars_str(cents: int) -> str:
     return str((Decimal(int(cents)) / Decimal(100)).quantize(Decimal("0.01")))
 
 
+def floor_contracts(count: float, fractional: bool = True) -> float:
+    """Quantize a contract count downward to what the venue can fill.
+
+    Fractional markets fill in 0.01-contract steps; others in whole contracts.
+    (The tiny epsilon absorbs float error so e.g. ``0.29 * 100`` doesn't floor
+    to 28 hundredths.)
+    """
+    if fractional:
+        return int(count * 100 + 1e-9) / 100.0
+    return float(int(count + 1e-9))
+
+
 def fixed_point_str(count: float) -> str:
-    """Format a contract quantity as a fixed-point (2dp) string, e.g. ``"10.00"``."""
-    return f"{int(count)}.00"
+    """Format a contract quantity as a fixed-point (2dp) string.
+
+    ``10`` -> ``"10.00"``, ``2.5`` -> ``"2.50"`` -- the wire format for
+    fractional (0.01-granularity) contract counts.
+    """
+    return f"{count:.2f}"
 
 
 def market_price_cents(market: dict, base: str) -> Optional[int]:

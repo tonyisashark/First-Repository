@@ -90,6 +90,9 @@ class KalshiClient:
         self.timeout = timeout
         self.order_api = order_api
         self.session = requests.Session()
+        # Tickers that rejected a fractional count (fractional trading is
+        # enabled market-by-market); their orders are floored to whole.
+        self._whole_only: set = set()
 
     # -- low level ---------------------------------------------------------
     def _request(
@@ -206,6 +209,7 @@ class KalshiClient:
             if price_cents is not None:
                 price_cents = 100 - price_cents
         if self.order_api == "legacy":
+            # The legacy schema takes integer counts only: whole contracts.
             body = {
                 "ticker": ticker,
                 "client_order_id": str(uuid.uuid4()),
@@ -225,6 +229,8 @@ class KalshiClient:
                 # v2 has no market type: cross the book with an IOC at the edge.
                 price_cents = 99 if is_buy else 1
                 time_in_force = "immediate_or_cancel"
+            if ticker in self._whole_only:
+                count = money.floor_contracts(count, fractional=False)
             body = {
                 "ticker": ticker,
                 "client_order_id": str(uuid.uuid4()),
@@ -234,7 +240,22 @@ class KalshiClient:
                 "time_in_force": time_in_force,
                 "self_trade_prevention_type": "taker_at_cross",
             }
-            resp = self._request("POST", "/portfolio/events/orders", json_body=body, require_auth=True)
+            try:
+                resp = self._request("POST", "/portfolio/events/orders", json_body=body, require_auth=True)
+            except requests.HTTPError:
+                # Fractional trading is enabled market-by-market; a market that
+                # rejects "10.50" still takes "10.00". Retry floored, once.
+                whole = money.floor_contracts(count, fractional=False)
+                if whole == count or whole < 1:
+                    raise
+                logger.info(
+                    "%s rejected fractional count %s; retrying with %d whole contracts",
+                    ticker, body["count"], int(whole),
+                )
+                self._whole_only.add(ticker)
+                body["count"] = money.fixed_point_str(whole)
+                body["client_order_id"] = str(uuid.uuid4())
+                resp = self._request("POST", "/portfolio/events/orders", json_body=body, require_auth=True)
         return self._normalize_order(resp)
 
     def cancel_order(self, order_id: str) -> dict:

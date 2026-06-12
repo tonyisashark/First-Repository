@@ -227,13 +227,16 @@ def test_best_candidate_maximizes_growth():
 
 
 # --- position_size -----------------------------------------------------------
-def test_position_size_basic():
-    # $300 balance, deploy 1/3 = $100 = 10000c, at 90c -> floor(10000/90) = 111
-    assert position_size(300_00, 1 / 3, 90) == 111
+def test_position_size_fractional_deploys_budget_exactly():
+    # $300 balance, deploy 1/3 = $100, at 90c -> 111.11 contracts ($99.999).
+    assert position_size(300_00, 1 / 3, 90) == pytest.approx(111.11)
+    # Small balances can trade too: 33.33c budget at 90c -> 0.37 contracts.
+    assert position_size(100, 1 / 3, 90) == pytest.approx(0.37)
 
 
-def test_position_size_floors():
-    assert position_size(100, 1 / 3, 90) == 0  # 33c budget, can't afford one @ 90c
+def test_position_size_whole_contracts_floor():
+    assert position_size(300_00, 1 / 3, 90, fractional=False) == 111
+    assert position_size(100, 1 / 3, 90, fractional=False) == 0
 
 
 def test_position_size_zero_price_guarded():
