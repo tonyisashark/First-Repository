@@ -94,12 +94,22 @@ def test_never_double_enters_same_market():
     assert [t.ticker for t in bot.trades] == ["A"]
 
 
-def test_entry_limit_is_capped_at_band_max():
+def test_entry_skipped_when_ask_above_band_max():
+    # ask=97 > band_max=95: a limit at 95 can't fill against a 97c ask, so skip.
     bot = make_bot(max_positions=1)
-    a = mv("A", volume=300, yes_bid=93, yes_ask=97)  # mid 95 in band; ask above max
+    a = mv("A", volume=300, yes_bid=93, yes_ask=97)
     set_markets(bot, [a, filler()])
     bot.tick()
-    assert bot.trades[0].buy_price == 95  # capped at buy_chance_max, not the 97 ask
+    assert bot.trades == []
+
+
+def test_entry_at_ask_when_ask_at_band_max():
+    # ask=95 == band_max=95: limit is placed exactly at the ask.
+    bot = make_bot(max_positions=1)
+    a = mv("A", volume=300, yes_bid=93, yes_ask=95)
+    set_markets(bot, [a, filler()])
+    bot.tick()
+    assert bot.trades[0].buy_price == 95
 
 
 def test_no_liquidity_position_does_not_consume_a_slot():

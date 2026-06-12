@@ -283,9 +283,16 @@ class TradingBot:
         if best is None or best.yes_ask is None:
             return
 
-        # Never bid above the top of the band: take the ask when it's inside,
-        # otherwise rest at the band's ceiling until filled or timed out.
-        limit_price = min(best.yes_ask, self.cfg.buy_chance_max_cents)
+        # Only enter when the ask is at or below the band ceiling -- a limit at the
+        # band max can't fill against a higher ask, and waiting for it to drop
+        # within the buy timeout is unrealistic on illiquid daily-range markets.
+        if best.yes_ask > self.cfg.buy_chance_max_cents:
+            logger.debug(
+                "Skipping %s: ask %dc is above band max %dc",
+                best.ticker, best.yes_ask, self.cfg.buy_chance_max_cents,
+            )
+            return
+        limit_price = best.yes_ask
         balance = self._budget_balance_cents()
         count = position_size(balance, self.cfg.portfolio_fraction, limit_price)
         if count < 1:
