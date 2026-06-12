@@ -40,6 +40,8 @@ def make_bot(client=None, **overrides):
     bot.heartbeat_interval = 10_000
     bot.book_poll_seconds = 0.0       # poll books on every tick
     bot.ewma_half_life = 0.0          # no smoothing lag in tests
+    bot.min_estimate_history = 0.0    # no estimate-maturity wait in tests
+    bot.min_estimate_samples = 0
     return bot
 
 
@@ -75,6 +77,20 @@ def edged_universe(bot, ticker="A", event="E"):
 def set_markets(bot, views):
     bot._market_cache = views
     bot._last_scan = time.time()
+
+
+def test_immature_estimate_does_not_trade():
+    # A first book snapshot seeds the estimate outright; it must not be able
+    # to buy a position by itself -- only a repeated reading may trade.
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    bot.min_estimate_samples = 3
+    edged_universe(bot)
+    bot.tick()                                # 1 sample: edge visible, no trade
+    assert bot.trades == []
+    bot.tick()                                # 2 samples: still warming up
+    assert bot.trades == []
+    bot.tick()                                # 3 samples: mature -> trades
+    assert [t.ticker for t in bot.trades] == ["A"]
 
 
 def test_no_orderbook_capability_means_no_trades():
@@ -141,6 +157,22 @@ def test_respects_max_positions():
     bot.tick()  # at cap -> no third entry attempt
     assert sorted(t.ticker for t in bot.trades) == ["A", "B"]
     assert all(t.state is TradeState.HOLDING for t in bot.trades)
+
+
+def test_one_position_per_event():
+    # An overpriced event (bids sum to 114) gives BOTH buckets a NO edge --
+    # but they stem from one event-level estimate, one failure mode. Only one
+    # may be held at a time even with free slots.
+    client = FakeBookClient({
+        "A": {"yes": [[55, 5000]], "no": [[43, 5000]]},
+        "Z": {"yes": [[59, 5000]], "no": [[39, 5000]]},
+    })
+    bot = make_bot(client=client, max_positions=5)
+    set_markets(bot, [mv("A", yes_bid=55, yes_ask=57), mv("Z", yes_bid=59, yes_ask=61)])
+    bot.tick()
+    bot.tick()
+    assert len(bot.trades) == 1
+    assert bot.trades[0].event == "E"
 
 
 def test_never_double_enters_same_market():

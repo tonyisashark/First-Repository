@@ -119,6 +119,14 @@ def test_renormalization_ignores_stale_tail_residue():
     assert no.edge_cents < 0  # NO at 8c on a settled winner is not an edge
 
 
+def test_scale_up_requires_full_ask_coverage():
+    # Z has a bid but no ask: "buy the whole event under parity" is impossible,
+    # so the cheap-looking partial ask-sum (92) must not inflate A's estimate.
+    markets = [mk("A", yes_bid=91, yes_ask=92), mk("Z", yes_bid=2)]
+    est = renormalized_estimates(markets, {"A": 91.5})
+    assert est["A"] == pytest.approx(91.5)
+
+
 def test_renormalization_skipped_when_sum_is_implausible():
     # A lone 50c bucket sums to 50 -- far from a complete event, so scaling it
     # to 100% would be nonsense; the raw estimate is kept.

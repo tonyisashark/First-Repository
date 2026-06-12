@@ -93,6 +93,11 @@ SERIES_REQUEST_SPACING = 0.15
 # Fetches are budgeted per tick so tracking can't burst past the rate limit.
 PREFILTER_SLACK_CENTS = 8.0
 BOOK_FETCH_BUDGET_PER_TICK = 5
+# An estimate may only TRADE once it has real history: several book samples
+# over a minimum age. A first glance at a book seeds the EWMA outright, so
+# without this gate one quirky snapshot could buy a position by itself.
+MIN_ESTIMATE_HISTORY_SECONDS = 15.0
+MIN_ESTIMATE_SAMPLES = 3
 
 
 class TradeState(Enum):
@@ -109,6 +114,7 @@ class Trade:
     side: str                              # "yes" or "no"
     count: float                           # contracts (0.01 granularity on v2)
     buy_price: Optional[int]               # in the side's own terms
+    event: str = ""                        # event ticker ("" when unknown)
     state: TradeState = TradeState.BUYING
     buy_order: Optional[dict] = None
     exit_order: Optional[dict] = None
@@ -141,6 +147,8 @@ class TradingBot:
         self.book_poll_seconds = BOOK_POLL_SECONDS
         self.buy_timeout = BUY_TIMEOUT_SECONDS
         self.ewma_half_life = EWMA_HALF_LIFE_SECONDS
+        self.min_estimate_history = MIN_ESTIMATE_HISTORY_SECONDS
+        self.min_estimate_samples = MIN_ESTIMATE_SAMPLES
 
         self._market_cache: List[MarketView] = []
         self._last_scan: float = 0.0
@@ -150,6 +158,8 @@ class TradingBot:
 
         # EWMA-smoothed microprice per ticker: ticker -> (value_cents, updated_at).
         self._micro_ewma: Dict[str, Tuple[float, float]] = {}
+        # Estimate maturity per ticker: ticker -> (first_sample_at, n_samples).
+        self._micro_history: Dict[str, Tuple[float, int]] = {}
         # Last fetched book summary per ticker: ticker -> (summary, fetched_at).
         self._book_cache: Dict[str, Tuple[dict, float]] = {}
         self._book_polled_at: Dict[str, float] = {}
@@ -191,11 +201,13 @@ class TradingBot:
     # -- main step ---------------------------------------------------------
     def tick(self) -> None:
         markets = self._get_markets()
-        self._maybe_heartbeat(markets)
         # Advance each open position; drop the ones that have gone flat.
         self.trades = [t for t in self.trades if not self._manage_trade(t, markets)]
         # Open new positions while we have free slots.
         self._maybe_enter(markets)
+        # Heartbeat last, so it reports this tick's fetches and entries rather
+        # than a snapshot the entry logic is about to make stale.
+        self._maybe_heartbeat(markets)
 
     # -- heartbeat ---------------------------------------------------------
     def _maybe_heartbeat(self, markets: List[MarketView]) -> None:
@@ -327,6 +339,18 @@ class TradingBot:
             if (now - ts) < ESTIMATE_MAX_AGE_SECONDS
         }
 
+    def _tradable_estimates(self, markets: List[MarketView]) -> Dict[str, float]:
+        """Estimates mature enough to put money behind: enough samples over
+        enough time that one quirky book snapshot can't trade by itself.
+        (The heartbeat shows immature estimates too; trading does not.)"""
+        now = time.time()
+        mature: Dict[str, float] = {}
+        for ticker, value in self._estimates(markets).items():
+            first_at, samples = self._micro_history.get(ticker, (now, 0))
+            if samples >= self.min_estimate_samples and (now - first_at) >= self.min_estimate_history:
+                mature[ticker] = value
+        return mature
+
     def _note_book(self, ticker: str, summary: dict, now: float) -> None:
         """Fold one fetched order book into the per-ticker EWMA estimate."""
         self._book_cache[ticker] = (summary, now)
@@ -341,13 +365,20 @@ class TradingBot:
             return
         self._book_stats["ok"] += 1
         previous = self._micro_ewma.get(ticker)
-        if previous is None or self.ewma_half_life <= 0:
+        # A stale series restarts: its old history must not vouch for new data.
+        fresh_start = previous is None or (now - previous[1]) >= ESTIMATE_MAX_AGE_SECONDS
+        if fresh_start or self.ewma_half_life <= 0:
             value = micro
         else:
             # Half-life decay: alpha is the weight of the new sample.
             alpha = 1.0 - 0.5 ** ((now - previous[1]) / self.ewma_half_life)
             value = previous[0] + alpha * (micro - previous[0])
         self._micro_ewma[ticker] = (value, now)
+        if fresh_start:
+            self._micro_history[ticker] = (now, 1)
+        else:
+            first_at, samples = self._micro_history.get(ticker, (now, 0))
+            self._micro_history[ticker] = (first_at, samples + 1)
 
     def _fetch_book(self, ticker: str, now: float) -> Optional[dict]:
         """Fetch + record one market's order book; ``None`` on failure."""
@@ -418,14 +449,19 @@ class TradingBot:
             for ticker, ts in self._exited_at.items()
             if (now - ts) < REENTRY_COOLDOWN_SECONDS  # recently force-exited
         )
+        # One position per event: same-event "edges" share one estimate (and
+        # one failure mode -- an event-level renormalization error shows up as
+        # several phantom edges at once), and same-event YES buys are mutually
+        # exclusive outcomes anyway.
+        held_events = {t.event for t in self.trades if t.event}
         candidates = [
             c
             for c in select_trade_candidates(
                 markets,
-                estimates=self._estimates(markets),
+                estimates=self._tradable_estimates(markets),
                 portfolio_fraction=self.cfg.portfolio_fraction,
             )
-            if c.market.ticker not in blocked
+            if c.market.ticker not in blocked and c.market.event_ticker not in held_events
         ]
         best = best_candidate(candidates)
         if best is None:
@@ -467,7 +503,8 @@ class TradingBot:
             cand.fraction * 100, balance,
         )
         trade = Trade(
-            ticker=cand.market.ticker, side=cand.side, count=count, buy_price=cand.price_cents,
+            ticker=cand.market.ticker, side=cand.side, count=count,
+            buy_price=cand.price_cents, event=cand.market.event_ticker,
         )
 
         if self.cfg.dry_run:

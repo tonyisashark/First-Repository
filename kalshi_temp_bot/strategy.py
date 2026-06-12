@@ -192,30 +192,48 @@ def renormalized_estimates(
     conservative side of the book is used for the factor, so the correction
     is never larger than what resting orders actually justify.
 
+    The sums are built from *executable* quotes: every resting bid counts
+    toward the bid-sum however wide its book (it is sellable money), while the
+    scale-up requires every bucket in the event to carry an ask -- otherwise
+    the whole-event purchase is impossible and a cheap-looking partial sum
+    would fabricate edges. Crossed views disqualify the scale-up entirely.
+
     Rail-priced values (outside ``RAIL_MIN/MAX_CENTS``) are settlement
-    certainty, not opinion: they are never rescaled. Uninformative
-    (wide-spread) books contribute nothing to the sums and get no estimate.
+    certainty, not opinion: they are never rescaled.
     """
     bid_sums: Dict[str, float] = {}
     ask_sums: Dict[str, float] = {}
+    asks_complete: Dict[str, bool] = {}
     for market in markets:
-        if not informative(market):
-            continue
         event = market.event_ticker
-        bid_sums[event] = bid_sums.get(event, 0.0) + (market.yes_bid or 0)
-        ask_sums[event] = ask_sums.get(event, 0.0) + market.yes_ask
+        bid, ask = market.yes_bid, market.yes_ask
+        if bid is not None and ask is not None and bid > ask:
+            # Crossed view: data skew (sides updated at different times).
+            asks_complete[event] = False
+            continue
+        if bid is not None:
+            # Any resting bid is sellable money, however wide the book.
+            bid_sums[event] = bid_sums.get(event, 0.0) + bid
+        if ask is not None:
+            ask_sums[event] = ask_sums.get(event, 0.0) + ask
+        else:
+            # "Buy the whole event at ask < 100c" is only an arbitrage if
+            # every bucket can actually be bought; a bucket with no ask
+            # invalidates the event's scale-up.
+            asks_complete[event] = False
 
     final: Dict[str, float] = {}
     for market in markets:
         value = raw_estimates.get(market.ticker)
         if value is None:
             continue
-        sum_bid = bid_sums.get(market.event_ticker, 0.0)
-        sum_ask = ask_sums.get(market.event_ticker, 0.0)
+        event = market.event_ticker
+        sum_bid = bid_sums.get(event, 0.0)
+        sum_ask = ask_sums.get(event, 0.0)
         factor = 1.0
         if 100.0 < sum_bid <= RENORM_SUM_MAX:
             factor = 100.0 / sum_bid
-        elif RENORM_SUM_MIN <= sum_ask < 100.0:
+        elif asks_complete.get(event, True) and RENORM_SUM_MIN <= sum_ask < 100.0:
             factor = 100.0 / sum_ask
         if RAIL_MIN_CENTS < value < RAIL_MAX_CENTS:
             value *= factor
