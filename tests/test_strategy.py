@@ -158,7 +158,7 @@ def test_idle_summary_skips_rail_priced_markets():
     ]
     text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
     assert "WIN" not in text and "T1" not in text
-    assert "closest:" in text
+    assert "best edge:" in text
 
 
 def test_renormalization_ignores_uninformative_quotes():
@@ -331,7 +331,7 @@ def test_idle_summary_reports_closest_miss():
     text = idle_watch_summary(
         markets, estimates={"A": 94.0}, portfolio_fraction=1 / 3, now=NOW)
     assert "no side above" in text
-    assert "closest: A" in text
+    assert "best edge: A" in text
     assert "~" not in text  # book-backed, not approximate
 
 
@@ -340,7 +340,7 @@ def test_idle_summary_falls_back_to_approximate_mids():
     # is still reported, marked as approximate.
     markets = [mk("A", yes_bid=92, yes_ask=94), mk("Z", yes_bid=5, yes_ask=7)]
     text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
-    assert "closest:" in text
+    assert "best edge:" in text
     assert "~" in text
 
 

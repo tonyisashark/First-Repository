@@ -363,8 +363,9 @@ def idle_watch_summary(
     """One-line, human-readable summary of what the bot sees while idle.
 
     Reports the universe size, how many sides currently clear the edge bar,
-    and the best edge on offer (even when it is below the bar, so the operator
-    can see how close the bot is to acting).
+    and the single highest edge on offer across every market and side -- even
+    when it is below the bar, so the operator can always see the most
+    profitable opportunity the universe currently contains.
     """
     if not markets:
         return "watching 0 markets -- check Environment=prod and the series tickers"
@@ -384,9 +385,9 @@ def idle_watch_summary(
             f"@ {best.price_cents}c edge {best.edge_cents:+.1f}c"
         )
 
-    # Nothing clears the bar -- show the closest miss so progress is visible.
-    # Markets without a book-backed estimate fall back to their renormalized
-    # quoted mid (marked with ~) so the distance to the bar is always shown.
+    # Nothing clears the bar -- show the highest edge anyway so the operator
+    # can see the best opportunity on offer. Markets without a book-backed
+    # estimate fall back to their renormalized quoted mid (marked with ~).
     rough = renormalized_estimates(
         markets,
         {
@@ -413,7 +414,7 @@ def idle_watch_summary(
         return f"{head} | books too wide or one-sided to estimate (off-hours lull?)"
     approx = "" if near.market.ticker in estimates else "~"
     return (
-        f"{head} | no side above the +{MIN_EDGE_CENTS:.0f}c edge bar | closest: "
+        f"{head} | no side above the +{MIN_EDGE_CENTS:.0f}c edge bar | best edge: "
         f"{near.market.ticker} {near.side.upper()} est {approx}{near.chance_cents:.1f}% "
         f"@ {near.price_cents}c edge {approx}{near.edge_cents:+.1f}c"
     )
