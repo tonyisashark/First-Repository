@@ -33,6 +33,7 @@ position can't block new trades.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -54,6 +55,7 @@ from .strategy import (
     MarketView,
     TradeCandidate,
     best_candidate,
+    evaluate_maker_side,
     evaluate_side,
     idle_watch_summary,
     informative,
@@ -62,6 +64,7 @@ from .strategy import (
     parse_time,
     position_size,
     renormalized_estimates,
+    select_maker_candidates,
     select_trade_candidates,
     side_quotes,
     taker_fee_cents,
@@ -77,7 +80,13 @@ POLL_INTERVAL_SECONDS = 1.0        # decision-loop cadence
 SCAN_INTERVAL_SECONDS = 15.0       # REST market-universe re-scan cadence
 HEARTBEAT_INTERVAL_SECONDS = 30.0  # "I'm alive" status-line cadence
 BOOK_POLL_SECONDS = 5.0            # per-ticker order-book fetch cadence
-BUY_TIMEOUT_SECONDS = 30.0         # cancel an unfilled entry order after this
+BUY_TIMEOUT_SECONDS = 30.0         # cancel an unfilled TAKER entry after this
+# A resting maker bid is patient by design, but stale prices are dangerous:
+# cancel and let the next tick repost at the freshly-estimated level.
+MAKER_BUY_TIMEOUT_SECONDS = 60.0
+# A resting take-profit offer gets this long to earn the spread before the
+# bot falls back to selling at the bid (the bird in hand).
+EXIT_OFFER_TIMEOUT_SECONDS = 60.0
 LIQUIDITY_EXIT_BUFFER = 2.0        # sell when exit-side depth <= this x position
 # Take-profit: the strategy harvests convergence rather than holding to
 # settlement, so the same bankroll cycles through several edges a day. Sell
@@ -120,6 +129,7 @@ MIN_ESTIMATE_SAMPLES = 3
 class TradeState(Enum):
     BUYING = "buying"
     HOLDING = "holding"
+    OFFERING = "offering"                  # take-profit offer resting in the book
     EXITING = "exiting"
 
 
@@ -132,10 +142,15 @@ class Trade:
     count: float                           # contracts (0.01 granularity on v2)
     buy_price: Optional[int]               # in the side's own terms
     event: str = ""                        # event ticker ("" when unknown)
+    maker: bool = False                    # entry rested inside the spread (no fee)
     state: TradeState = TradeState.BUYING
     buy_order: Optional[dict] = None
     exit_order: Optional[dict] = None
     buy_placed_at: float = 0.0
+    cost_cents: float = 0.0                # all-in entry cost per contract (set on fill)
+    exit_offer_price: Optional[int] = None # resting take-profit offer level
+    exit_offer_at: float = 0.0
+    last_mark_cents: Optional[float] = None  # latest sellable value (bid - fee)
     depth_checked_at: float = 0.0          # last order-book poll
     bid_depth: Optional[float] = None      # last observed exit-side depth
     missing_scans: int = 0                 # consecutive scans without the market
@@ -164,6 +179,8 @@ class TradingBot:
         self.book_poll_seconds = BOOK_POLL_SECONDS
         self.background_poll_seconds = BACKGROUND_POLL_SECONDS
         self.buy_timeout = BUY_TIMEOUT_SECONDS
+        self.maker_buy_timeout = MAKER_BUY_TIMEOUT_SECONDS
+        self.exit_offer_timeout = EXIT_OFFER_TIMEOUT_SECONDS
         self.ewma_half_life = EWMA_HALF_LIFE_SECONDS
         self.min_estimate_history = MIN_ESTIMATE_HISTORY_SECONDS
         self.min_estimate_samples = MIN_ESTIMATE_SAMPLES
@@ -188,6 +205,12 @@ class TradingBot:
         # estimate state explains itself ("all books one-sided" vs "fetches
         # failing" need opposite responses).
         self._book_stats = {"ok": 0, "unusable": 0, "failed": 0}
+
+        # Paper ledger (dry-run): real cash accounting so the heartbeat shows
+        # actual session profitability, not a static configured balance.
+        self._paper_balance: float = float(config.paper_balance_cents)
+        self._paper_pnl: float = 0.0
+        self._paper_closed: int = 0
 
     # -- lifecycle ---------------------------------------------------------
     def run(self) -> None:
@@ -260,6 +283,11 @@ class TradingBot:
             )
         self._book_stats = {"ok": 0, "unusable": 0, "failed": 0}
         head = f"{self._occupied_slots(markets)}/{self.cfg.max_positions} slots, {len(self.trades)} position(s)"
+        if self.cfg.dry_run:
+            head += (
+                f" | paper ${self._paper_balance / 100:.2f}"
+                f" (P&L {self._paper_pnl / 100:+.2f}, {self._paper_closed} closed)"
+            )
         if not self.trades:
             return f"{watch} | {head}"
         briefs = []
@@ -446,7 +474,8 @@ class TradingBot:
             edges = [
                 cand.edge_cents
                 for side in ("yes", "no")
-                if (cand := evaluate_side(market, side, estimate, self.cfg.portfolio_fraction))
+                for evaluate in (evaluate_side, evaluate_maker_side)
+                if (cand := evaluate(market, side, estimate, self.cfg.portfolio_fraction))
             ]
             if edges and max(edges) >= MIN_EDGE_CENTS - PREFILTER_SLACK_CENTS:
                 scored.append((max(edges), market))
@@ -493,7 +522,11 @@ class TradingBot:
 
     # -- entry ---------------------------------------------------------------
     def _maybe_enter(self, markets: List[MarketView]) -> None:
-        if self._occupied_slots(markets) >= self.cfg.max_positions:
+        free = self.cfg.max_positions - self._occupied_slots(markets)
+        pending_makers = [
+            t for t in self.trades if t.state is TradeState.BUYING and t.maker
+        ]
+        if free <= 0 and not pending_makers:
             return
         self._update_book_estimates(markets)
         now = time.time()
@@ -508,19 +541,56 @@ class TradingBot:
         # several phantom edges at once), and same-event YES buys are mutually
         # exclusive outcomes anyway.
         held_events = {t.event for t in self.trades if t.event}
-        candidates = [
+        estimates = self._tradable_estimates(markets)
+
+        def allowed(cand: TradeCandidate) -> bool:
+            return (
+                cand.market.ticker not in blocked
+                and cand.market.event_ticker not in held_events
+            )
+
+        taker = best_candidate([
             c
             for c in select_trade_candidates(
-                markets,
-                estimates=self._tradable_estimates(markets),
+                markets, estimates=estimates,
                 portfolio_fraction=self.cfg.portfolio_fraction,
             )
-            if c.market.ticker not in blocked and c.market.event_ticker not in held_events
-        ]
-        best = best_candidate(candidates)
-        if best is None:
+            if allowed(c)
+        ])
+
+        if free <= 0:
+            # Every slot is busy, but a resting maker bid yields to a live
+            # taker edge: a certain fill at >= the bar beats a maybe-fill.
+            if taker is None:
+                return
+            victim = min(pending_makers, key=lambda t: t.buy_placed_at)
+            logger.info(
+                "Preempting resting bid %s %s @ %sc for taker edge %s %s",
+                victim.ticker, victim.side.upper(), victim.buy_price,
+                taker.market.ticker, taker.side.upper(),
+            )
+            self._cancel(victim.buy_order)
+            self.trades.remove(victim)
+            self._enter(taker, maker=False)
             return
 
+        if taker is not None:
+            self._enter(taker, maker=False)
+            return
+        # No taker edge: rest a fee-free bid one tick inside the spread of the
+        # best maker candidate instead. The spread becomes income, not a cost.
+        maker = best_candidate([
+            c
+            for c in select_maker_candidates(
+                markets, estimates=estimates,
+                portfolio_fraction=self.cfg.portfolio_fraction,
+            )
+            if allowed(c)
+        ])
+        if maker is not None:
+            self._enter(maker, maker=True)
+
+    def _enter(self, best: TradeCandidate, maker: bool) -> None:
         # Fractional (0.01-contract) sizing deploys the budget almost exactly;
         # the legacy order schema only takes whole contracts.
         fractional = self.cfg.order_api != "legacy"
@@ -533,7 +603,7 @@ class TradingBot:
                 best.market.ticker, best.side.upper(), balance,
             )
             return
-        self._open_trade(best, count, balance)
+        self._open_trade(best, count, balance, maker=maker)
 
     def _cap_by_book_depth(self, cand: TradeCandidate, count: float) -> float:
         """Never size beyond what the book can fill -- entry fills against one
@@ -548,10 +618,11 @@ class TradingBot:
             entry_depth, exit_depth = summary["yes_total"], summary["no_total"]
         return min(count, entry_depth, exit_depth)
 
-    def _open_trade(self, cand: TradeCandidate, count: float, balance: int) -> None:
+    def _open_trade(self, cand: TradeCandidate, count: float, balance: int, maker: bool = False) -> None:
         logger.info(
-            "ENTER %s %s | est %.1f%% vs cost %.1fc (edge %+.1fc, growth %+.4f) | "
+            "ENTER %s %s %s | est %.1f%% vs cost %.1fc (edge %+.1fc, growth %+.4f) | "
             "buying %g @ %dc (%.0f%% of %sc balance)",
+            "MAKER" if maker else "TAKER",
             cand.market.ticker, cand.side.upper(), cand.chance_cents, cand.cost_cents,
             cand.edge_cents, cand.growth, count, cand.price_cents,
             cand.fraction * 100, balance,
@@ -559,14 +630,17 @@ class TradingBot:
         trade = Trade(
             ticker=cand.market.ticker, side=cand.side, count=count,
             buy_price=cand.price_cents, event=cand.market.event_ticker,
+            maker=maker,
         )
 
         if self.cfg.dry_run:
-            logger.info(
-                "[PAPER] filled buy %g %s %s @ %dc",
-                count, cand.market.ticker, cand.side.upper(), cand.price_cents,
-            )
-            self._begin_holding(trade)
+            if maker:
+                # The bid rests; the paper fill happens when the market trades
+                # down through it (see _trade_check_buy).
+                trade.buy_placed_at = time.time()
+                trade.state = TradeState.BUYING
+            else:
+                self._paper_fill_entry(trade)
         else:
             trade.buy_order = self.client.create_order(
                 ticker=cand.market.ticker,
@@ -579,6 +653,39 @@ class TradingBot:
             trade.buy_placed_at = time.time()
             trade.state = TradeState.BUYING
         self.trades.append(trade)
+
+    def _entry_cost_cents(self, trade: Trade) -> Optional[float]:
+        """All-in entry cost per contract: makers pay no fee, takers do.
+        ``None`` for adopted positions with an unknown entry price."""
+        if trade.cost_cents:
+            return trade.cost_cents
+        if trade.buy_price is None:
+            return None
+        fee = 0.0 if trade.maker else taker_fee_cents(trade.buy_price)
+        return float(trade.buy_price) + fee
+
+    def _paper_fill_entry(self, trade: Trade) -> None:
+        trade.cost_cents = self._entry_cost_cents(trade) or 0.0
+        self._paper_balance -= trade.cost_cents * trade.count
+        logger.info(
+            "[PAPER] filled buy %g %s %s @ %dc (%s, all-in %.2fc)",
+            trade.count, trade.ticker, trade.side.upper(), trade.buy_price,
+            "maker" if trade.maker else "taker", trade.cost_cents,
+        )
+        self._begin_holding(trade)
+
+    def _paper_close(self, trade: Trade, value_cents: float, reason: str) -> bool:
+        proceeds = value_cents * trade.count
+        self._paper_balance += proceeds
+        pnl = (value_cents - trade.cost_cents) * trade.count if trade.cost_cents else 0.0
+        self._paper_pnl += pnl
+        self._paper_closed += 1
+        logger.info(
+            "[PAPER] %s %s closed (%s): %.2fc/contract x %g -> %+.0fc | session P&L %+.0fc",
+            trade.ticker, trade.side.upper(), reason, value_cents, trade.count,
+            pnl, self._paper_pnl,
+        )
+        return True
 
     def _begin_holding(self, trade: Trade) -> None:
         logger.info(
@@ -594,9 +701,11 @@ class TradingBot:
         """Advance one position. Returns True when it is finished (flat) and
         should be dropped from the active list."""
         if trade.state is TradeState.BUYING:
-            return self._trade_check_buy(trade)
+            return self._trade_check_buy(trade, markets)
         if trade.state is TradeState.HOLDING:
             return self._trade_manage_holding(trade, markets)
+        if trade.state is TradeState.OFFERING:
+            return self._trade_manage_offering(trade, markets)
         if trade.state is TradeState.EXITING:
             return self._trade_check_exit(trade, markets)
         return False
@@ -610,12 +719,32 @@ class TradingBot:
         held = signed if trade.side == "yes" else -signed
         return max(0.0, held)
 
-    def _trade_check_buy(self, trade: Trade) -> bool:
-        held = self._held_for(trade)
-        timed_out = (time.time() - trade.buy_placed_at) >= self.buy_timeout
+    def _trade_check_buy(self, trade: Trade, markets: List[MarketView]) -> bool:
+        timeout = self.maker_buy_timeout if trade.maker else self.buy_timeout
+        timed_out = (time.time() - trade.buy_placed_at) >= timeout
 
+        if self.cfg.dry_run:
+            # Paper maker fill: the market trading down through the resting
+            # bid is the only fill observable from quotes alone. This is the
+            # pessimistic (purely adversely-selected) case -- real fills also
+            # come from uninformed sellers hitting the bid -- so paper results
+            # UNDERSTATE the maker path rather than flattering it.
+            ask = self._side_ask(self._market_for(markets, trade.ticker), trade.side)
+            if ask is not None and trade.buy_price is not None and ask <= trade.buy_price:
+                self._paper_fill_entry(trade)
+                return False
+            if timed_out:
+                logger.info(
+                    "[PAPER] resting bid %s %s @ %sc did not fill within %ss; cancelled",
+                    trade.ticker, trade.side.upper(), trade.buy_price, timeout,
+                )
+                return True
+            return False
+
+        held = self._held_for(trade)
         if held >= trade.count - 0.005:  # full fill (within fixed-point rounding)
             trade.buy_order = None
+            trade.cost_cents = self._entry_cost_cents(trade) or 0.0
             logger.info("Buy fully filled %g %s %s; entering HOLDING", held, trade.ticker, trade.side.upper())
             self._begin_holding(trade)
             return False
@@ -624,11 +753,12 @@ class TradingBot:
             self._cancel(trade.buy_order)
             trade.buy_order = None
             trade.count = held
+            trade.cost_cents = self._entry_cost_cents(trade) or 0.0
             logger.info("Buy filled %g %s %s; entering HOLDING", held, trade.ticker, trade.side.upper())
             self._begin_holding(trade)
             return False
         if timed_out:
-            logger.info("Buy for %s did not fill within %ss; cancelling", trade.ticker, self.buy_timeout)
+            logger.info("Buy for %s did not fill within %ss; cancelling", trade.ticker, timeout)
             self._cancel(trade.buy_order)
             return True
         return False
@@ -646,11 +776,13 @@ class TradingBot:
             # count as a close.)
             trade.missing_scans += 1
             if self.cfg.dry_run and trade.missing_scans >= 3:
-                logger.info(
-                    "[PAPER] %s left the scan; treating the position as settled",
-                    trade.ticker,
-                )
-                return True
+                # Settled away from observation: credit the ledger at the last
+                # sellable mark (conservative -- a ridden winner settles at
+                # 100c but is booked at its final observed bid).
+                value = trade.last_mark_cents
+                if value is None:
+                    value = trade.cost_cents
+                return self._paper_close(trade, value, "settled, marked at last bid")
             logger.debug("%s not in the current scan; holding through to settlement", trade.ticker)
             return self._settled_flat(trade)
         trade.missing_scans = 0
@@ -666,6 +798,15 @@ class TradingBot:
                 depth = summary["yes_total"] if trade.side == "yes" else summary["no_total"]
                 trade.bid_depth = depth
 
+        # Track the latest sellable value (bid net of exit fee): it is the
+        # paper mark for any exit and the trigger input for the rest.
+        estimate = self._estimates(markets).get(trade.ticker)
+        side_bid = self._side_bid(market, trade.side)
+        sell_value: Optional[float] = None
+        if side_bid is not None and 1 <= side_bid <= 99:
+            sell_value = side_bid - taker_fee_cents(side_bid)
+            trade.last_mark_cents = sell_value
+
         # 1) Liquidity exit: sell while the book still has enough depth on our
         #    exit side to actually fill the position. An empty book (depth 0)
         #    is unsellable -- hold quietly instead of spamming doomed orders.
@@ -678,11 +819,8 @@ class TradingBot:
 
         # 2) Edge reversal: the bid now overprices our side vs the estimate --
         #    selling captures more value than holding, win or lose.
-        estimate = self._estimates(markets).get(trade.ticker)
-        side_bid = self._side_bid(market, trade.side)
-        if estimate is not None and side_bid is not None and 1 <= side_bid <= 99:
+        if estimate is not None and sell_value is not None:
             chance = estimate if trade.side == "yes" else 100.0 - estimate
-            sell_value = side_bid - taker_fee_cents(side_bid)
             if sell_value - chance >= EXIT_EDGE_CENTS:
                 logger.info(
                     "%s %s bid %dc nets %.1fc vs est %.1f%% -- selling (edge reversal)",
@@ -695,17 +833,122 @@ class TradingBot:
             #    to settlement would add almost nothing in expectation --
             #    recycle the bankroll into the next dislocation instead. No
             #    re-entry cooldown: the entry bar guards against churn.
-            if trade.buy_price is not None:
-                cost_basis = trade.buy_price + taker_fee_cents(trade.buy_price)
+            cost_basis = self._entry_cost_cents(trade)
+            if cost_basis is not None:
                 locked = sell_value - cost_basis
                 remaining = chance - sell_value
                 if locked >= TAKE_PROFIT_MIN_GAIN_CENTS and remaining < TAKE_PROFIT_REMAINING_CENTS:
+                    # Prefer harvesting as a maker: an offer resting inside
+                    # the spread sells higher AND fee-free. Taker fallback
+                    # when the spread leaves no room.
+                    offer = self._exit_offer_level(market, trade.side, chance)
+                    if offer is not None:
+                        return self._post_exit_offer(trade, offer, locked, remaining)
                     logger.info(
                         "%s %s bid %dc locks %+.1fc over %.1fc cost; holding adds only %.1fc "
                         "-- taking profit",
                         trade.ticker, trade.side.upper(), side_bid, locked, cost_basis, remaining,
                     )
                     return self._force_exit(trade, "take-profit", cooldown=False)
+        return False
+
+    @staticmethod
+    def _exit_offer_level(market: MarketView, side: str, chance: float) -> Optional[int]:
+        """Where to rest a take-profit offer: as high as the book allows while
+        staying at/above fair value, one tick inside the spread. ``None`` when
+        the spread leaves no room (taker is then the only exit)."""
+        quotes = side_quotes(market, side)
+        bid, ask = quotes["bid"], quotes["ask"]
+        if bid is None or ask is None or ask - bid < 2:
+            return None
+        level = min(ask - 1, max(bid + 1, math.ceil(chance)))
+        if not (1 <= level <= 99):
+            return None
+        return int(level)
+
+    def _post_exit_offer(self, trade: Trade, level: int, locked: float, remaining: float) -> bool:
+        trade.exit_offer_price = level
+        trade.exit_offer_at = time.time()
+        if not self.cfg.dry_run:
+            trade.exit_order = self.client.create_order(
+                ticker=trade.ticker, is_buy=False, count=trade.count,
+                price_cents=level, time_in_force="good_till_canceled",
+                side=trade.side,
+            )
+        logger.info(
+            "%s %s converged (locks %+.1fc at bid, %.1fc left to earn) -- offering %g @ %dc "
+            "(maker, fee-free; taker fallback in %.0fs)",
+            trade.ticker, trade.side.upper(), locked, remaining,
+            trade.count, level, self.exit_offer_timeout,
+        )
+        trade.state = TradeState.OFFERING
+        return False
+
+    def _trade_manage_offering(self, trade: Trade, markets: List[MarketView]) -> bool:
+        """A take-profit offer is resting in the book: detect its fill, keep
+        the defensive exits armed, and fall back to the bid on timeout."""
+        market = self._market_for(markets, trade.ticker)
+        if market is None:
+            # Market vanished mid-offer: pull the order and let the HOLDING
+            # logic handle settlement/disappearance accounting.
+            self._cancel(trade.exit_order)
+            trade.exit_order = None
+            trade.state = TradeState.HOLDING
+            return False
+        trade.missing_scans = 0
+        now = time.time()
+
+        if self.cfg.dry_run:
+            bid = self._side_bid(market, trade.side)
+            if (
+                bid is not None and trade.exit_offer_price is not None
+                and bid >= trade.exit_offer_price
+            ):
+                # The bid rose to (or through) the offer: it filled.
+                return self._paper_close(trade, float(trade.exit_offer_price), "take-profit maker")
+        else:
+            held = self._held_for(trade)
+            if held <= 0:
+                logger.info(
+                    "%s %s offer filled at %sc; flat",
+                    trade.ticker, trade.side.upper(), trade.exit_offer_price,
+                )
+                return True
+            trade.count = held  # manage only what remains after partial fills
+
+        # Defensive exits stay armed while the offer rests.
+        estimate = self._estimates(markets).get(trade.ticker)
+        side_bid = self._side_bid(market, trade.side)
+        sell_value: Optional[float] = None
+        chance: Optional[float] = None
+        if side_bid is not None and 1 <= side_bid <= 99:
+            sell_value = side_bid - taker_fee_cents(side_bid)
+            trade.last_mark_cents = sell_value
+        if estimate is not None:
+            chance = estimate if trade.side == "yes" else 100.0 - estimate
+        if sell_value is not None and chance is not None and sell_value - chance >= EXIT_EDGE_CENTS:
+            self._cancel(trade.exit_order)
+            trade.exit_order = None
+            return self._force_exit(trade, "edge-reversal")
+
+        if (now - trade.exit_offer_at) >= self.exit_offer_timeout:
+            # The patient attempt had its window. If the bid still locks the
+            # gain, take it; otherwise re-evaluate from HOLDING next tick.
+            self._cancel(trade.exit_order)
+            trade.exit_order = None
+            cost_basis = self._entry_cost_cents(trade)
+            if (
+                sell_value is not None and chance is not None and cost_basis is not None
+                and sell_value - cost_basis >= TAKE_PROFIT_MIN_GAIN_CENTS
+                and chance - sell_value < TAKE_PROFIT_REMAINING_CENTS
+            ):
+                logger.info(
+                    "%s %s offer at %sc unfilled for %.0fs; selling at the bid instead",
+                    trade.ticker, trade.side.upper(), trade.exit_offer_price,
+                    self.exit_offer_timeout,
+                )
+                return self._force_exit(trade, "take-profit", cooldown=False)
+            trade.state = TradeState.HOLDING
         return False
 
     def _settled_flat(self, trade: Trade) -> bool:
@@ -733,11 +976,11 @@ class TradingBot:
             # re-enter as soon as a fresh edge clears the bar.
             self._exited_at[trade.ticker] = time.time()
         if self.cfg.dry_run:
-            logger.info(
-                "[PAPER] %s %s sold at market (%s) -- position closed",
-                trade.ticker, trade.side.upper(), reason,
-            )
-            return True
+            # Credit the ledger at the latest sellable mark (bid - fee).
+            value = trade.last_mark_cents
+            if value is None:
+                value = trade.cost_cents  # never marked: close at breakeven
+            return self._paper_close(trade, value, reason)
 
         # Aggressive sell that sweeps all resting bids (market-order semantics).
         trade.exit_order = self.client.create_order(
@@ -770,13 +1013,14 @@ class TradingBot:
     def _occupied_slots(self, markets: List[MarketView]) -> int:
         """How many positions count against ``max_positions``.
 
-        A HOLDING/EXITING position whose market has no exit liquidity (no bid
-        on its side to sell into) is excluded, so a stuck position can't block
+        A held position whose market has no exit liquidity (no bid on its
+        side to sell into) is excluded, so a stuck position can't block
         new trades.
         """
+        held_states = (TradeState.HOLDING, TradeState.OFFERING, TradeState.EXITING)
         slots = 0
         for trade in self.trades:
-            if trade.state in (TradeState.HOLDING, TradeState.EXITING) and not self._has_exit_liquidity(trade, markets):
+            if trade.state in held_states and not self._has_exit_liquidity(trade, markets):
                 continue
             slots += 1
         return slots
@@ -787,14 +1031,22 @@ class TradingBot:
             return None
         return side_quotes(market, side)["bid"]
 
+    @staticmethod
+    def _side_ask(market: Optional[MarketView], side: str) -> Optional[int]:
+        if market is None:
+            return None
+        return side_quotes(market, side)["ask"]
+
     def _has_exit_liquidity(self, trade: Trade, markets: List[MarketView]) -> bool:
         bid = self._side_bid(self._market_for(markets, trade.ticker), trade.side)
         return bid is not None and bid > 0
 
     # -- helpers -----------------------------------------------------------
     def _budget_balance_cents(self) -> int:
-        if self.client.auth is None:
-            return self.cfg.paper_balance_cents
+        if self.cfg.dry_run or self.client.auth is None:
+            # The evolving paper ledger, so dry-run sizing compounds (and
+            # shrinks) with results exactly as live sizing would.
+            return max(0, int(self._paper_balance))
         try:
             return money.balance_cents(self.client.get_balance())
         except Exception as exc:

@@ -129,6 +129,59 @@ def test_background_coverage_waits_for_its_cadence():
     assert "W" not in bot._fresh_micro()
 
 
+def wide_maker_universe(bot):
+    # Book 40/56 with depth stacked on the bid: microprice ~55.2, so the ask
+    # (56 + 1.7c fee) shows NO taker edge, but a bid resting at 41 has ~14c of
+    # fee-free edge -- well above even the wide-book bar (~10.8c).
+    a = mv("A", yes_bid=40, yes_ask=56)
+    z = mv("Z", yes_bid=42, yes_ask=58)            # same event: no renorm
+    bot.client.books["A"] = {"yes": [[40, 2000]], "no": [[44, 100]]}
+    set_markets(bot, [a, z])
+    return a
+
+
+def test_maker_entry_rests_inside_the_spread():
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    a = wide_maker_universe(bot)
+    bot.tick()
+    trade = bot.trades[0]
+    assert (trade.maker, trade.state, trade.buy_price) == (True, TradeState.BUYING, 41)
+
+    # The market trades down through the resting bid -> paper fill, fee-free.
+    a.yes_ask = 41
+    bot.tick()
+    assert bot.trades[0].state is TradeState.HOLDING
+    assert bot.trades[0].cost_cents == 41.0        # no taker fee as a maker
+    assert bot._paper_balance == pytest.approx(300_00 - 41.0 * bot.trades[0].count)
+
+
+def test_maker_entry_times_out_and_is_repriced_next_tick():
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    wide_maker_universe(bot)
+    bot.maker_buy_timeout = 0.0                    # expire immediately
+    bot.tick()
+    assert bot.trades and bot.trades[0].maker      # posted this tick
+    bot.tick()                                     # timed out, unfilled -> cancelled
+    # ... and immediately re-posted at the fresh price (no cooldown).
+    assert bot.trades and bot.trades[0].state is TradeState.BUYING
+
+
+def test_taker_edge_preempts_a_resting_maker_bid():
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    a = wide_maker_universe(bot)
+    bot.tick()
+    assert bot.trades[0].maker                     # slot used by a resting bid
+
+    # A genuine taker edge appears in another event: yield the slot to it.
+    b = mv("B", event="E2")
+    bot.client.books["B"] = edge_book()
+    set_markets(bot, [a, mv("Z", yes_bid=42, yes_ask=58), b, filler("E2")])
+    bot.tick()
+    assert [(t.ticker, t.maker, t.state) for t in bot.trades] == [
+        ("B", False, TradeState.HOLDING)
+    ]
+
+
 def test_no_orderbook_capability_means_no_trades():
     bot = make_bot(client=FakeClient(), max_positions=1)
     set_markets(bot, [mv("A"), filler()])
@@ -293,18 +346,27 @@ def test_edge_reversal_exit_cashes_out_an_overpriced_bid():
 def test_take_profit_harvests_a_converged_winner():
     # The strategy cashes several edges a day from one slot: once the market
     # converges and pays the edge (bid nets a real gain over the all-in cost,
-    # holding adds < 1c), the position is sold and the slot freed -- it is NOT
-    # ridden to settlement for the last fraction of a cent.
+    # holding adds < 1c), the position is harvested -- first as a fee-free
+    # offer resting inside the spread, filled when the bid rises to it.
     bot = make_bot(client=FakeBookClient(), max_positions=1)
     a = edged_universe(bot)
     bot.tick()
-    assert bot.trades[0].state is TradeState.HOLDING  # bought at 92c
+    assert bot.trades[0].state is TradeState.HOLDING  # bought at 92c (taker)
 
     a.yes_bid, a.yes_ask = 98, 100
     bot.client.books["A"] = {"yes": [[98, 100_000]], "no": [[1, 100_000]]}
     bot.tick()
-    assert bot.trades == []                   # paper sell: position closed
+    trade = bot.trades[0]
+    assert trade.state is TradeState.OFFERING  # resting one tick inside the spread
+    assert trade.exit_offer_price == 99
+
+    a.yes_bid = 99                            # bid rises to the offer: filled
+    bot.tick()
+    assert bot.trades == []                   # position closed, slot free
     assert "A" not in bot._exited_at          # harvest -> no re-entry cooldown
+    # Ledger: bought 108.69 @ 92c + 0.52c fee, sold @ 99c fee-free.
+    assert bot._paper_pnl == pytest.approx(108.69 * (99 - 92.5152), rel=1e-3)
+    assert bot._paper_closed == 1
 
 
 def test_unconverged_position_is_held_not_harvested():

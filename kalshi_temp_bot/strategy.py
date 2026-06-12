@@ -22,9 +22,10 @@ edge -- YES or NO.
    * gate   = a book wider than ``MAX_INFORMATIVE_SPREAD_CENTS`` carries no
      probability information and produces no estimate at all.
 
-2. Edge: for each market, both sides are priced as a taker --
-   YES at the ask, NO at ``100 - bid`` -- including Kalshi's taker fee
-   (``0.07 * P * (1-P)`` per contract). ``edge = estimate - all-in cost``.
+2. Edge: for each market, both sides are priced two ways -- as a taker
+   (at the ask, plus Kalshi's ``0.07 * P * (1-P)`` taker fee) and as a maker
+   (a bid resting one tick inside the spread, fee-free). ``edge = estimate -
+   all-in cost``. Takers get certainty; makers get the spread as income.
 
 3. Selection: among sides clearing an uncertainty-scaled edge bar (floor
    ``MIN_EDGE_CENTS``, rising with spread and time to close), rank by expected
@@ -339,20 +340,52 @@ def required_edge_cents(market: MarketView, now: Optional[datetime] = None) -> f
     return bar
 
 
-def select_trade_candidates(
+def evaluate_maker_side(
+    market: MarketView,
+    side: str,
+    estimate_cents: float,
+    portfolio_fraction: float,
+) -> Optional[TradeCandidate]:
+    """Price one side of one market as a MAKER: a bid resting one tick inside
+    the spread. Maker orders pay no Kalshi fee, so the entire chance-price gap
+    is edge -- but the fill is uncertain and adversely selected (someone must
+    sell down into the bid), which the caller's edge bar must cover.
+
+    Needs at least a 2c spread (one tick of room); on a 1c book the taker
+    path is the only way in.
+    """
+    quotes = side_quotes(market, side)
+    bid, ask = quotes["bid"], quotes["ask"]
+    if bid is None or ask is None:
+        return None
+    price = bid + 1
+    if price >= ask or not (1 <= price <= 99):
+        return None
+    chance = estimate_cents if side == "yes" else 100.0 - estimate_cents
+    cost = float(price)  # no maker fee
+    fraction = min(portfolio_fraction, kelly_fraction(chance, cost))
+    return TradeCandidate(
+        market=market,
+        side=side,
+        price_cents=price,
+        chance_cents=chance,
+        cost_cents=cost,
+        edge_cents=chance - cost,
+        fraction=fraction,
+        growth=growth_rate(chance, cost, fraction),
+    )
+
+
+def _select_candidates(
     markets: List[MarketView],
     *,
     estimates: Dict[str, float],
     portfolio_fraction: float,
-    min_edge_cents: float = MIN_EDGE_CENTS,
-    min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE,
-    now: Optional[datetime] = None,
+    evaluator,
+    min_edge_cents: float,
+    min_seconds_to_close: int,
+    now: Optional[datetime],
 ) -> List[TradeCandidate]:
-    """Every market side worth taking: edge >= the minimum and positive growth.
-
-    ``estimates`` is the output of :func:`renormalized_estimates` -- only
-    tickers with a (book-backed, fresh) estimate are eligible at all.
-    """
     now = now or datetime.now(timezone.utc)
     candidates: List[TradeCandidate] = []
     for market in markets:
@@ -364,12 +397,55 @@ def select_trade_candidates(
             continue
         bar = max(min_edge_cents, required_edge_cents(market, now))
         for side in ("yes", "no"):
-            cand = evaluate_side(market, side, estimate, portfolio_fraction)
+            cand = evaluator(market, side, estimate, portfolio_fraction)
             if cand is None:
                 continue
             if cand.edge_cents >= bar and cand.growth > 0.0:
                 candidates.append(cand)
     return candidates
+
+
+def select_trade_candidates(
+    markets: List[MarketView],
+    *,
+    estimates: Dict[str, float],
+    portfolio_fraction: float,
+    min_edge_cents: float = MIN_EDGE_CENTS,
+    min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE,
+    now: Optional[datetime] = None,
+) -> List[TradeCandidate]:
+    """Every market side worth taking at the ask: edge >= the (scaled) bar.
+
+    ``estimates`` is the output of :func:`renormalized_estimates` -- only
+    tickers with a (book-backed, fresh) estimate are eligible at all.
+    """
+    return _select_candidates(
+        markets, estimates=estimates, portfolio_fraction=portfolio_fraction,
+        evaluator=evaluate_side, min_edge_cents=min_edge_cents,
+        min_seconds_to_close=min_seconds_to_close, now=now,
+    )
+
+
+def select_maker_candidates(
+    markets: List[MarketView],
+    *,
+    estimates: Dict[str, float],
+    portfolio_fraction: float,
+    min_edge_cents: float = MIN_EDGE_CENTS,
+    min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE,
+    now: Optional[datetime] = None,
+) -> List[TradeCandidate]:
+    """Every side worth RESTING a bid for, one tick inside the spread.
+
+    Same edge bar as the taker path, but priced at bid+1 with no fee -- on a
+    wide book this clears the bar long before the ask does, converting the
+    spread from a cost into income when the bid fills.
+    """
+    return _select_candidates(
+        markets, estimates=estimates, portfolio_fraction=portfolio_fraction,
+        evaluator=evaluate_maker_side, min_edge_cents=min_edge_cents,
+        min_seconds_to_close=min_seconds_to_close, now=now,
+    )
 
 
 def best_candidate(candidates: List[TradeCandidate]) -> Optional[TradeCandidate]:

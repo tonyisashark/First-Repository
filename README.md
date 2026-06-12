@@ -16,22 +16,32 @@ there are no strategy knobs to configure.
   events can't fabricate edges. Rail-priced buckets (≤3¢/≥97¢) are pinned —
   they're settlement certainty, not opinion. Books too wide to mean anything
   produce no estimate at all.
-- **Entry:** every market is priced on both sides as a taker (YES at the ask,
-  NO at `100 − bid`), **including Kalshi's taker fee**. Sides with at least
-  **+2¢ net edge** (estimate vs all-in cost) are ranked by **expected
-  log-growth of the bankroll**, and the single best one is bought.
+- **Entry:** every market is priced on both sides two ways — as a **taker**
+  (YES at the ask, NO at `100 − bid`, including Kalshi's taker fee) and as a
+  **maker** (a fee-free bid resting one tick inside the spread). The edge bar
+  is **uncertainty-scaled**: 2¢ floor, +½¢ per cent of quoted spread, +0.15¢
+  per hour to close (capped +3¢) — wide morning books must show real
+  dislocation, tight late-day books trade at ~3¢. Qualifying sides are ranked
+  by **expected log-growth of the bankroll**; a taker edge is bought
+  immediately, otherwise the best maker side is rested (and instantly yields
+  its slot if a live taker edge appears).
 - **Size:** the configured bankroll fraction (default **1/3**), automatically
   **capped at the trade's Kelly fraction** (thin edges deploy less) and by the
   order book's visible depth on both the entry and exit sides. Sizing uses
   Kalshi's **fractional contracts (0.01 granularity)**, so the dollar budget is
   deployed almost exactly; markets without fractional trading enabled fall
   back to whole contracts automatically.
-- **Exit:** two self-tuning rules — **liquidity** (sell right before the exit
-  side's resting depth runs out: depth ≤ 2× position) and **edge reversal**
-  (sell when the market's bid overprices the held side by ≥ 3¢ net of the exit
-  fee — cashing out beats holding, win or lose). A position that hits neither
-  **rides through close and settles**. Sells are only ever attempted while the
-  book has a bid; an exited market is not re-entered for 5 minutes.
+- **Exit:** the preferred exit is the **take-profit harvest** — once the
+  market converges and pays the edge (the bid, net of fees, locks ≥ 1¢ over
+  the all-in entry cost and holding to settlement would add < 1¢), the bot
+  sells and recycles the bankroll into the next dislocation, resting a
+  fee-free offer inside the spread first and falling back to the bid after
+  60s. Two defensive exits protect the downside: **liquidity** (sell right
+  before the exit side's resting depth runs out: depth ≤ 2× position) and
+  **edge reversal** (sell when the bid overprices the held side by ≥ 3¢ net
+  of fees). Only a position the market never pays for **rides through close
+  and settles**. Sells are only attempted while the book has a bid; a
+  defensively-exited market is not re-entered for 5 minutes.
 - **Concurrency:** up to **`MAX_POSITIONS`** positions at once (default 1). A
   position with no exit liquidity doesn't consume a slot, so a stuck position
   can't block new trades.
@@ -52,13 +62,15 @@ there are no strategy knobs to configure.
               ▼                                                                  │
    estimate true probability            pick the single best side               │
    ───────────────────────────         ───────────────────────────              │
-   order-book microprice                YES @ ask  /  NO @ 100−bid              │
-   → EWMA smoothing            ──▶      net edge ≥ 2¢ (fees included)   ──▶  BUY (Kelly-capped size)
+   order-book microprice                taker @ ask  /  maker bid inside spread │
+   → EWMA smoothing            ──▶      edge ≥ scaled bar (fees included) ──▶  BUY (Kelly-capped size)
    → event renormalization              max expected log-growth                  │
                                                                                  ▼
-        settle through close  ◀── neither exit hit ──  HOLDING ── depth ≤ 2× position → SELL
+     converged & paid ≥ 1¢? ──▶ SELL (offer inside spread, bid fallback) ◀── HOLDING
                                                           │
-                                                          └── bid overprices side ≥ 3¢ → SELL
+                          depth ≤ 2× position → SELL ◀────┼────▶ bid overprices side ≥ 3¢ → SELL
+                                                          │
+                                          never paid → settle through close
 ```
 
 **Why renormalization is the edge:** each temperature event's buckets are
@@ -169,14 +181,18 @@ probability model, edge thresholds, exit rules and timing are self-tuned.
 | `PAPER_BALANCE_CENTS` | `100000` | sizing balance while paper trading without credentials |
 | `KALSHI_ORDER_API` | `v2` | `v2` (current) or `legacy` order endpoint |
 
-Fixed, self-tuned internals (for the curious): minimum net edge **2¢**; edge
-reversal exit **3¢**; liquidity exit at **2×** position depth; EWMA half-life
-**20 s**; estimates stale after **60 s**; spreads wider than **20¢** carry no
-information; book-level weight halves every **3¢** from the touch; taker fee
-**0.07·P·(1−P)**; books polled every **5 s** (5 fetches/tick budget, tracking
-every market within **8¢** of the edge bar); no entry within **5 min** of
-close; **5 min** re-entry cooldown after an exit; buy orders cancelled after
-**30 s** unfilled.
+Fixed, self-tuned internals (for the curious): edge bar floor **2¢** + **½¢**
+per cent of spread + **0.15¢**/hour to close (capped **+3¢**); take-profit
+once **≥1¢** is locked and **<1¢** remains; edge reversal exit **3¢**;
+liquidity exit at **2×** position depth; EWMA half-life **20 s**; estimates
+stale after **60 s**; spreads wider than **20¢** carry no information;
+book-level weight halves every **3¢** from the touch; taker fee
+**0.07·P·(1−P)**, maker orders fee-free; books polled every **5 s** for
+near-edge markets (8 fetches/tick budget; leftover budget round-robins the
+whole board every **~25 s**); no entry within **5 min** of close; **5 min**
+re-entry cooldown after a defensive exit; taker buys cancelled after **30 s**
+unfilled, resting maker bids repriced every **60 s**, resting take-profit
+offers fall back to the bid after **60 s**.
 
 ---
 
