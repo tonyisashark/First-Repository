@@ -1,9 +1,13 @@
 """Configuration for the Kalshi daily-temperature trading bot.
 
-All knobs are read from environment variables (optionally via a local ``.env``
-file).  Sensible, *safe* defaults are used so that a fresh checkout runs in
-demo + dry-run mode and never risks real money until the operator explicitly
-opts in.
+Only the knobs an operator genuinely needs are exposed; everything about the
+probability model, edge thresholds and timing is self-tuned in
+:mod:`kalshi_temp_bot.strategy` / :mod:`kalshi_temp_bot.bot`.
+
+All settings are read from environment variables (optionally via a local
+``.env`` file). Sensible, *safe* defaults are used so that a fresh checkout
+runs in demo + dry-run mode and never risks real money until the operator
+explicitly opts in.
 """
 
 from __future__ import annotations
@@ -105,46 +109,16 @@ class Config:
     # --- which markets ---
     temperature_series: List[str] = field(default_factory=lambda: list(DEFAULT_TEMPERATURE_SERIES))
 
-    # --- strategy parameters ---
-    # Buy when the *estimated* chance falls inside this band (cents; 1c = 1%).
-    # The estimate is an EWMA-smoothed, depth-weighted book midpoint
-    # (microprice), renormalized across the event's buckets -- a stabler read of
-    # "what the market believes" than the displayed last-trade chance.
-    buy_chance_min_cents: int = 90
-    buy_chance_max_cents: int = 95
-    # Reject markets whose bid/ask spread exceeds this -- a wide book carries no
-    # real probability information.
-    max_spread_cents: int = 5
-    # EWMA half-life for smoothing the microprice (seconds).
-    chance_smoothing_seconds: float = 30.0
-    # Exit on liquidity, not price: force-sell while the book still has enough
-    # bid depth to fill the position. Triggers when the total resting YES-bid
-    # quantity falls to/below ``liquidity_exit_buffer x position size``.
-    liquidity_exit_buffer: float = 2.0
-    liquidity_poll_seconds: float = 5.0    # how often to poll the order book per position
-    # Stop-loss: if the YES bid falls to or below this, sell the position. 0 = off.
-    # Never fires when there is no bid at all (nothing to sell into).
-    min_sell_price_cents: int = 0
-    # Maximum number of concurrent positions. A position whose market has no exit
-    # liquidity (no YES bid) does NOT count against this cap.
+    # --- risk appetite ---
+    # Bankroll fraction deployed per trade. This is a *ceiling*: each trade is
+    # additionally capped at its own Kelly fraction, so a thin edge deploys less.
+    portfolio_fraction: float = 1.0 / 3.0
+    # Maximum number of concurrent positions. A position whose market has no
+    # exit liquidity (no bid on its side) does NOT count against this cap.
     max_positions: int = 1
-    volume_threshold_ratio: float = 2.0 / 3.0   # >= 2/3 of the max-volume market
-    portfolio_fraction: float = 1.0 / 3.0       # deploy 1/3 of the portfolio per trade
-    # "global" -> max volume is the single highest-volume market across all monitored [default]
-    # "event"  -> max volume is computed within each event (one city/day)
-    max_volume_scope: str = "global"
 
-    # --- timing ---
-    poll_interval_seconds: float = 1.0     # how often the decision loop runs
-    scan_interval_seconds: float = 5.0     # how often the market universe is re-fetched
-    use_websocket: bool = True             # realtime price updates between REST scans
-    min_seconds_to_close: int = 300        # don't open a trade in a market closing this soon
-    buy_timeout_seconds: int = 30          # cancel an unfilled entry order after this long
-    heartbeat_interval_seconds: float = 30.0  # how often to log an "I'm alive" status line
-
-    # --- order routing ---
+    # --- plumbing (env-only; rarely needed) ---
     order_api: str = "v2"  # "v2" -> /portfolio/events/orders ; "legacy" -> /portfolio/orders
-
     request_timeout: float = 10.0
 
     @property
@@ -176,31 +150,8 @@ class Config:
             dry_run=_get_bool("DRY_RUN", True),
             paper_balance_cents=_get_int("PAPER_BALANCE_CENTS", 1_000_00),
             temperature_series=series,
-            # BUY_CHANCE_CENTS / BUY_YES_PRICE_CENTS are legacy single-value
-            # names; when present they seed both ends of the band.
-            buy_chance_min_cents=_get_int(
-                "BUY_CHANCE_MIN_CENTS",
-                _get_int("BUY_CHANCE_CENTS", _get_int("BUY_YES_PRICE_CENTS", 90)),
-            ),
-            buy_chance_max_cents=_get_int(
-                "BUY_CHANCE_MAX_CENTS",
-                _get_int("BUY_CHANCE_CENTS", _get_int("BUY_YES_PRICE_CENTS", 95)),
-            ),
-            max_spread_cents=_get_int("MAX_SPREAD_CENTS", 5),
-            chance_smoothing_seconds=_get_float("CHANCE_SMOOTHING_SECONDS", 30.0),
-            liquidity_exit_buffer=_get_float("LIQUIDITY_EXIT_BUFFER", 2.0),
-            liquidity_poll_seconds=_get_float("LIQUIDITY_POLL_SECONDS", 5.0),
-            min_sell_price_cents=_get_int("MIN_SELL_PRICE_CENTS", 0),
-            max_positions=_get_int("MAX_POSITIONS", 1),
-            volume_threshold_ratio=_get_float("VOLUME_THRESHOLD_RATIO", 2.0 / 3.0),
             portfolio_fraction=_get_float("PORTFOLIO_FRACTION", 1.0 / 3.0),
-            max_volume_scope=_get_str("MAX_VOLUME_SCOPE", "global").lower(),
-            poll_interval_seconds=_get_float("POLL_INTERVAL_SECONDS", 1.0),
-            scan_interval_seconds=_get_float("SCAN_INTERVAL_SECONDS", 5.0),
-            use_websocket=_get_bool("USE_WEBSOCKET", True),
-            min_seconds_to_close=_get_int("MIN_SECONDS_TO_CLOSE", 300),
-            buy_timeout_seconds=_get_int("BUY_TIMEOUT_SECONDS", 30),
-            heartbeat_interval_seconds=_get_float("HEARTBEAT_INTERVAL_SECONDS", 30.0),
+            max_positions=_get_int("MAX_POSITIONS", 1),
             order_api=_get_str("KALSHI_ORDER_API", "v2").lower(),
             request_timeout=_get_float("REQUEST_TIMEOUT", 10.0),
         )

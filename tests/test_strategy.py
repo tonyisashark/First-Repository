@@ -5,31 +5,30 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kalshi_temp_bot.strategy import (
+    MIN_EDGE_CENTS,
     MarketView,
-    estimate_chance_cents,
-    event_mid_sums,
-    has_liquidity,
+    best_candidate,
+    evaluate_side,
+    growth_rate,
     idle_watch_summary,
+    informative,
+    kelly_fraction,
     microprice_cents,
     mid_price_cents,
     parse_time,
-    pick_best_candidate,
     position_size,
+    renormalized_estimates,
     seconds_to_close,
-    select_buy_candidates,
+    select_trade_candidates,
+    side_quotes,
     spread_cents,
-    volume_qualifying_markets,
+    taker_fee_cents,
 )
 
 NOW = datetime(2026, 6, 8, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def mk(ticker, *, event="EVT", volume=0.0, chance=None, yes_ask=None, yes_bid=None,
-       close_in_s=None):
-    # ``chance`` builds a tight book around the value (mid == chance, spread 2),
-    # the common case; pass yes_bid/yes_ask explicitly to shape the book.
-    if chance is not None and yes_ask is None and yes_bid is None:
-        yes_bid, yes_ask = chance - 1, chance + 1
+def mk(ticker, *, event="EVT", volume=100.0, yes_bid=None, yes_ask=None, close_in_s=None):
     close_time = NOW + timedelta(seconds=close_in_s) if close_in_s is not None else None
     return MarketView(
         ticker=ticker,
@@ -42,13 +41,7 @@ def mk(ticker, *, event="EVT", volume=0.0, chance=None, yes_ask=None, yes_bid=No
     )
 
 
-def band(markets, lo=90, hi=90, **kwargs):
-    kwargs.setdefault("volume_threshold_ratio", 2 / 3)
-    return {m.ticker for m in select_buy_candidates(
-        markets, min_chance_cents=lo, max_chance_cents=hi, now=NOW, **kwargs)}
-
-
-# --- chance estimation -------------------------------------------------------
+# --- book arithmetic ----------------------------------------------------------
 def test_mid_price_treats_missing_bid_as_zero():
     assert mid_price_cents(mk("X", yes_ask=10)) == 5.0
     assert mid_price_cents(mk("X", yes_bid=90, yes_ask=94)) == 92.0
@@ -59,6 +52,8 @@ def test_spread_counts_one_sided_books_as_wide():
     assert spread_cents(mk("X", yes_bid=90, yes_ask=94)) == 4
     assert spread_cents(mk("X", yes_ask=94)) == 94  # no bid -> effectively untradeable
     assert spread_cents(mk("X")) is None
+    assert informative(mk("X", yes_bid=80, yes_ask=99)) is True   # spread 19 <= 20
+    assert informative(mk("X", yes_bid=70, yes_ask=99)) is False  # spread 29 > 20
 
 
 def test_microprice_weights_toward_the_pressured_side():
@@ -70,107 +65,165 @@ def test_microprice_weights_toward_the_pressured_side():
     assert microprice_cents(None, 94, 5, 5) is None
 
 
-def test_estimate_renormalizes_event_overround():
-    # The event's buckets sum to 108% -> the 94c bucket's genuine chance ~87%.
+def test_side_quotes_mirror_for_no():
+    m = mk("X", yes_bid=92, yes_ask=95)
+    assert side_quotes(m, "yes") == {"bid": 92, "ask": 95}
+    assert side_quotes(m, "no") == {"bid": 5, "ask": 8}
+    empty = mk("X")
+    assert side_quotes(empty, "no") == {"bid": None, "ask": None}
+
+
+# --- renormalization ----------------------------------------------------------
+def test_renormalization_strips_event_overround():
+    # Buckets sum to 108% -> a 94c estimate's genuine chance is ~87%.
     markets = [
-        mk("BIG", chance=94),
-        mk("MID", chance=10),
-        mk("LOW", chance=4),
+        mk("BIG", yes_bid=93, yes_ask=95),
+        mk("MID", yes_bid=9, yes_ask=11),
+        mk("LOW", yes_bid=3, yes_ask=5),
     ]
-    sums = event_mid_sums(markets)
-    assert sums["EVT"] == pytest.approx(108.0)
-    assert estimate_chance_cents(markets[0], sums) == pytest.approx(94 * 100 / 108)
+    est = renormalized_estimates(markets, {"BIG": 94.0, "MID": 10.0, "LOW": 4.0})
+    assert est["BIG"] == pytest.approx(94 * 100 / 108)
+    assert est["MID"] == pytest.approx(10 * 100 / 108)
 
 
-def test_estimate_skips_renormalization_when_sum_is_implausible():
+def test_renormalization_uses_mids_for_book_less_buckets():
+    # Only BIG has a book estimate; the other bucket's quoted mid (6) still
+    # counts toward the event sum (94 + 6 = 100 -> no-op scaling).
+    markets = [mk("BIG", yes_bid=93, yes_ask=95), mk("REST", yes_bid=5, yes_ask=7)]
+    est = renormalized_estimates(markets, {"BIG": 94.0})
+    assert est["BIG"] == pytest.approx(94.0)
+    assert "REST" not in est  # no book estimate -> not tradeable
+
+
+def test_renormalization_skipped_when_sum_is_implausible():
     # A lone 50c bucket sums to 50 -- far from a complete event, so scaling it
     # to 100% would be nonsense; the raw estimate is kept.
-    markets = [mk("ONLY", chance=50)]
-    sums = event_mid_sums(markets)
-    assert estimate_chance_cents(markets[0], sums) == 50.0
+    markets = [mk("ONLY", yes_bid=49, yes_ask=51)]
+    est = renormalized_estimates(markets, {"ONLY": 50.0})
+    assert est["ONLY"] == 50.0
 
 
-def test_estimate_prefers_supplied_microprice():
-    markets = [mk("A", chance=90), mk("B", chance=10)]
-    sums = event_mid_sums(markets)  # 100 -> renormalization is a no-op
-    assert estimate_chance_cents(markets[0], sums, micro=92.5) == pytest.approx(92.5)
-
-
-# --- select_buy_candidates ---------------------------------------------------
-def test_selects_when_volume_and_chance_match():
+def test_renormalization_ignores_uninformative_mids():
+    # The wide-spread bucket would poison the event sum; it must not count.
     markets = [
-        mk("MAX", volume=300, chance=90),    # max volume, in band -> candidate
-        mk("TWO_THIRDS", volume=200, chance=90),  # exactly 2/3 of 300 -> candidate
-        mk("BELOW", volume=199, chance=90),  # just under 2/3 -> excluded
-        mk("WRONG", volume=300, chance=85),  # enough volume but out of band
+        mk("BIG", yes_bid=93, yes_ask=95),
+        mk("WIDE", yes_bid=1, yes_ask=99),   # spread 98: no information
+        mk("REST", yes_bid=5, yes_ask=7),
     ]
-    assert band(markets) == {"MAX", "TWO_THIRDS"}
+    est = renormalized_estimates(markets, {"BIG": 94.0})
+    assert est["BIG"] == pytest.approx(94.0)  # sum stays 94 + 6 = 100
 
 
-def test_band_is_inclusive_and_supports_a_range():
-    markets = [
-        mk("LO", volume=100, chance=90),
-        mk("IN", volume=100, chance=93),
-        mk("HI", volume=100, chance=95),
-        mk("OUT", volume=100, chance=96),
-    ]
-    assert band(markets, lo=90, hi=95) == {"LO", "IN", "HI"}
+# --- fee / kelly / growth ------------------------------------------------------
+def test_taker_fee_matches_kalshi_formula():
+    assert taker_fee_cents(94) == pytest.approx(0.07 * 94 * 6 / 100)   # ~0.39c
+    assert taker_fee_cents(50) == pytest.approx(1.75)                  # worst case
+    assert taker_fee_cents(99) == pytest.approx(0.0693)
 
 
-def test_spread_gate_rejects_wide_books():
-    markets = [
-        mk("TIGHT", volume=100, yes_bid=89, yes_ask=91),   # mid 90, spread 2
-        mk("WIDE", volume=100, yes_bid=80, yes_ask=100),   # mid 90 but spread 20
-    ]
-    assert band(markets, max_spread_cents=5) == {"TIGHT"}
+def test_kelly_fraction():
+    # p=96, cost=94 -> (96-94)/(100-94) = 1/3.
+    assert kelly_fraction(96, 94) == pytest.approx(1 / 3)
+    assert kelly_fraction(90, 94) == 0.0   # no edge -> no bet
+    assert kelly_fraction(50, 100) == 0.0
 
 
-def test_micro_estimates_override_the_midpoint():
-    markets = [mk("A", volume=100, chance=89), mk("B", volume=100, chance=11)]
-    # Event sums to 100 (renormalization is a no-op). The mid says 89 (out of
-    # band) but the smoothed microprice says 90 (in band).
-    assert band(markets) == set()
-    assert band(markets, micro_estimates={"A": 90.0}) == {"A"}
+def test_growth_rate_signs():
+    # An underpriced contract has positive growth; an overpriced one negative.
+    assert growth_rate(97, 94, 1 / 3) > 0
+    assert growth_rate(91, 94, 1 / 3) < 0
+    # Compounding penalty: even at a *fair* price the growth is negative
+    # (variance drag), which is exactly why the bot demands a positive edge.
+    assert growth_rate(94, 94, 1 / 3) < 0
 
 
-def test_event_scope_isolates_max_per_event():
-    # NY has a huge-volume market; CHI's smaller volumes should still qualify
-    # against CHI's own max, not NY's.
-    markets = [
-        mk("NY_BIG", event="NY", volume=900, chance=10),
-        mk("NY_SMALL", event="NY", volume=100, chance=90),  # < 2/3 of 900 -> excluded
-        mk("CHI_MAX", event="CHI", volume=120, chance=90),  # CHI max, in band
-        mk("CHI_OK", event="CHI", volume=80, chance=90),    # 80 >= 2/3*120 -> candidate
-    ]
-    assert band(markets, scope="event") == {"CHI_MAX", "CHI_OK"}
+# --- evaluate_side / selection --------------------------------------------------
+def test_evaluate_side_yes_and_no():
+    m = mk("X", yes_bid=92, yes_ask=94)
+    yes = evaluate_side(m, "yes", 96.0, 1 / 3)
+    assert yes.price_cents == 94
+    assert yes.cost_cents == pytest.approx(94 + taker_fee_cents(94))
+    assert yes.edge_cents == pytest.approx(96 - 94 - taker_fee_cents(94))
+
+    # NO is bought at 100 - bid = 8c; its chance is 100 - estimate.
+    no = evaluate_side(m, "no", 96.0, 1 / 3)
+    assert no.price_cents == 8
+    assert no.chance_cents == pytest.approx(4.0)
+    assert no.edge_cents < 0  # fairly priced -> no NO edge
+
+    assert evaluate_side(mk("X"), "yes", 96.0, 1 / 3) is None  # no ask -> no trade
 
 
-def test_default_scope_is_global():
-    # With no scope argument the single global max governs: CHI_MAX is excluded
-    # because NY_BIG's volume dominates across all monitored markets.
-    markets = [
-        mk("NY_BIG", event="NY", volume=900, chance=10),
-        mk("CHI_MAX", event="CHI", volume=120, chance=90),
-    ]
-    assert band(markets) == set()
+def test_fair_market_offers_no_candidate():
+    # Book 92/94, estimate equal to the mid: neither side clears the edge bar.
+    markets = [mk("A", yes_bid=92, yes_ask=94), mk("Z", yes_bid=5, yes_ask=7)]
+    est = renormalized_estimates(markets, {"A": 93.0})
+    cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    assert cands == []
+
+
+def test_underpriced_yes_is_selected():
+    # Ask 92 while the renormalized estimate is ~96.8 -> a real YES edge.
+    markets = [mk("A", yes_bid=91, yes_ask=92), mk("Z", yes_bid=2, yes_ask=4)]
+    est = renormalized_estimates(markets, {"A": 91.5})   # sum 91.5+3 -> renorm up
+    assert est["A"] == pytest.approx(91.5 * 100 / 94.5)
+    cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    assert [(c.market.ticker, c.side) for c in cands] == [("A", "yes")]
+    assert cands[0].edge_cents >= MIN_EDGE_CENTS
+    assert cands[0].growth > 0
+
+
+def test_overpriced_yes_selects_no_side():
+    # The bid (55) is far above the renormalized estimate (~47.8): buying NO
+    # at 45c with a ~52.2% chance is the edge.
+    markets = [mk("A", yes_bid=55, yes_ask=57), mk("Z", yes_bid=59, yes_ask=61)]
+    est = renormalized_estimates(markets, {"A": 55.0})   # sum 55+60=115 -> scale down
+    assert est["A"] == pytest.approx(55 * 100 / 115)
+    cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    assert [(c.market.ticker, c.side) for c in cands] == [("A", "no")]
+    no = cands[0]
+    assert no.price_cents == 45
+    assert no.chance_cents == pytest.approx(100 - 55 * 100 / 115)
+    # Thin-edge protection: the Kelly cap deploys less than the 1/3 ceiling.
+    assert no.fraction < 1 / 3
+    assert no.fraction == pytest.approx(
+        (no.chance_cents - no.cost_cents) / (100 - no.cost_cents))
+
+
+def test_markets_without_estimates_are_ignored():
+    markets = [mk("A", yes_bid=80, yes_ask=82)]
+    cands = select_trade_candidates(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
+    assert cands == []
 
 
 def test_skips_markets_closing_too_soon():
+    # Identical edges in two separate events; only the close time differs.
     markets = [
-        mk("SOON", volume=300, chance=90, close_in_s=60),   # closes in 60s
-        mk("LATER", volume=300, chance=90, close_in_s=9999),
+        mk("SOON", event="E1", yes_bid=91, yes_ask=92, close_in_s=60),
+        mk("Z1", event="E1", yes_bid=2, yes_ask=4),
+        mk("LATER", event="E2", yes_bid=91, yes_ask=92, close_in_s=9999),
+        mk("Z2", event="E2", yes_bid=2, yes_ask=4),
     ]
-    assert band(markets, min_seconds_to_close=300) == {"LATER"}
+    est = renormalized_estimates(markets, {"SOON": 91.5, "LATER": 91.5})
+    cands = select_trade_candidates(
+        markets, estimates=est, portfolio_fraction=1 / 3, min_seconds_to_close=300, now=NOW)
+    assert {c.market.ticker for c in cands} == {"LATER"}
 
 
-# --- pick_best_candidate -----------------------------------------------------
-def test_pick_best_is_highest_volume():
-    markets = [mk("A", volume=100, chance=90), mk("B", volume=250, chance=90)]
-    assert pick_best_candidate(markets).ticker == "B"
-
-
-def test_pick_best_empty_is_none():
-    assert pick_best_candidate([]) is None
+def test_best_candidate_maximizes_growth():
+    markets = [
+        mk("SMALL", yes_bid=93, yes_ask=94),
+        mk("BIG", yes_bid=89, yes_ask=90),
+        mk("Z", yes_bid=2, yes_ask=3),
+    ]
+    # Pre-renormalized estimates passed directly: SMALL has a 2.6c gross edge,
+    # BIG a 6c one; growth must prefer BIG.
+    est = {"SMALL": 96.6, "BIG": 96.0}
+    cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    assert {c.market.ticker for c in cands} == {"SMALL", "BIG"}
+    best = best_candidate(cands)
+    assert best.market.ticker == "BIG"
+    assert best_candidate([]) is None
 
 
 # --- position_size -----------------------------------------------------------
@@ -202,57 +255,29 @@ def test_seconds_to_close_unknown():
     assert seconds_to_close(mk("X"), now=NOW) is None
 
 
-# --- has_liquidity / volume_qualifying_markets --------------------------------
-def test_has_liquidity_excludes_rails():
-    for ask, expected in [(0, False), (1, False), (2, True), (50, True),
-                          (98, True), (99, False), (100, False), (None, False)]:
-        assert has_liquidity(mk("X", yes_ask=ask)) is expected
-
-
-def test_volume_qualifying_global():
-    markets = [mk("MAX", volume=300, chance=10), mk("OK", volume=200), mk("LOW", volume=199)]
-    got = {m.ticker for m in volume_qualifying_markets(
-        markets, volume_threshold_ratio=2 / 3, scope="global")}
-    assert got == {"MAX", "OK"}  # price is irrelevant to the volume filter
-
-
 # --- idle_watch_summary --------------------------------------------------------
-def summary(markets, lo=90, hi=90, **kwargs):
-    kwargs.setdefault("volume_threshold_ratio", 2 / 3)
-    return idle_watch_summary(
-        markets, min_chance_cents=lo, max_chance_cents=hi, now=NOW, **kwargs)
+def test_idle_summary_reports_best_candidate():
+    markets = [mk("A", yes_bid=91, yes_ask=92), mk("Z", yes_bid=2, yes_ask=4)]
+    est = renormalized_estimates(markets, {"A": 91.5})
+    text = idle_watch_summary(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    assert "watching 2 markets" in text
+    assert "best: A YES" in text
 
 
-def test_idle_summary_reports_counts_and_closest():
-    markets = [
-        mk("MAX", volume=300, chance=92),   # qualifies on volume, closest to band
-        mk("FAR", volume=300, chance=40),   # qualifies on volume, far from band
-        mk("LOW", volume=10, chance=90),    # in band but fails volume -> not a candidate
-    ]
-    text = summary(markets)
-    assert "watching 3 markets" in text
-    assert "0 in 90-90% chance band" in text
-    assert "closest qualifying MAX chance 92.0%" in text
+def test_idle_summary_reports_closest_miss():
+    markets = [mk("A", yes_bid=92, yes_ask=94), mk("Z", yes_bid=5, yes_ask=7)]
+    est = renormalized_estimates(markets, {"A": 93.0})  # fair -> no candidate
+    text = idle_watch_summary(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+    assert "no side above" in text
+    assert "closest: A" in text
 
 
-def test_idle_summary_skips_no_liquidity_closest():
-    # The rail-priced market is numerically closest to the band but has no real
-    # liquidity, so the liquid 70c market should be reported instead.
-    markets = [
-        mk("RAIL", volume=300, yes_bid=98, yes_ask=99),    # ask on the 99c rail
-        mk("LIQUID", volume=300, chance=70),               # real two-sided book
-    ]
-    text = summary(markets)
-    assert "closest qualifying LIQUID chance 70.0%" in text
-    assert "RAIL" not in text
+def test_idle_summary_without_estimates():
+    markets = [mk("A", yes_bid=92, yes_ask=94)]
+    text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
+    assert "no tradeable book estimates yet" in text
 
 
 def test_idle_summary_empty():
-    assert "watching 0 markets" in summary([])
-
-
-def test_idle_summary_hides_closest_when_candidate_exists():
-    markets = [mk("HIT", volume=300, chance=90), mk("REST", volume=300, chance=10)]
-    text = summary(markets)
-    assert "1 in 90-90% chance band" in text
-    assert "closest" not in text
+    text = idle_watch_summary([], estimates={}, portfolio_fraction=1 / 3, now=NOW)
+    assert "watching 0 markets" in text

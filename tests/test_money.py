@@ -41,6 +41,29 @@ def test_market_volume():
     assert money.market_volume({}) == 0.0
 
 
+def test_orderbook_summary_best_prices_and_totals():
+    book = {"yes": [[90, 100], [91, 50]], "no": [[7, 200], [8, 40]]}
+    s = money.orderbook_summary(book)
+    assert s["bid"] == 91                      # best resting YES bid
+    assert s["ask"] == 92                      # 100 - best NO bid (8)
+    assert s["yes_total"] == 150.0
+    assert s["no_total"] == 240.0
+
+
+def test_orderbook_summary_decay_weights_depth_near_the_touch():
+    # 50 at the touch + 100 one decay-width (3c) away -> 50 + 100/2 = 100.
+    book = {"yes": [[91, 50], [88, 100]], "no": []}
+    s = money.orderbook_summary(book, decay_cents=3.0)
+    assert s["bid_eff"] == 100.0
+    assert s["ask"] is None and s["ask_eff"] == 0.0
+
+
+def test_orderbook_summary_empty():
+    s = money.orderbook_summary({})
+    assert s["bid"] is None and s["ask"] is None
+    assert s["yes_total"] == 0.0 and s["no_total"] == 0.0
+
+
 def test_position_contracts_signed():
     assert money.position_contracts({"position_fp": "10.00"}) == 10.0
     assert money.position_contracts({"position": -5}) == -5.0

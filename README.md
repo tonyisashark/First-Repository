@@ -1,29 +1,36 @@
 # Kalshi Daily-Temperature Trading Bot
 
-A Python bot that trades **YES** on Kalshi daily-temperature markets using a
-simple, fully-specified rule set:
+A Python bot that trades Kalshi daily-temperature markets by estimating each
+market's **true probability purely from market data** and buying whichever side
+— **YES or NO** — offers the greatest genuine edge. The model is self-tuned:
+there are no strategy knobs to configure.
 
-- **Entry:** buy YES in a temperature *range* market whose volume is **≥ 2/3 of
-  the maximum-volume range market**, and whose **estimated chance falls inside
-  the configured band** (`BUY_CHANCE_MIN_CENTS`–`BUY_CHANCE_MAX_CENTS`, default
-  90–95; 1¢ = 1%). The estimate is built from market data rather than the noisy
-  displayed last-trade chance: a depth-weighted order-book midpoint
-  (microprice), EWMA-smoothed over time, renormalized across the event's
-  buckets (which must sum to ~100%), and gated by a maximum bid/ask spread.
-- **Size:** deploy **1/3 of the current portfolio** on each trade.
-- **Exit:** liquidity-aware — the bot watches the order book and **sells right
-  before the bid liquidity needed to exit runs out** (when total YES-bid depth
-  falls to ≤ `LIQUIDITY_EXIT_BUFFER` × position size). An optional **stop-loss**
-  (`MIN_SELL_PRICE_CENTS`) sells once the bid falls to/below a floor. Sells are
-  only ever attempted while the book has at least one bid; a worthless position
-  with an empty book is held quietly instead of spamming doomed sell orders.
+- **Probability estimate:** a multi-level, depth-weighted order-book midpoint
+  (microprice: resting pressure near the touch pulls the estimate toward the
+  opposite quote, deeper levels count at exponentially decaying weight),
+  EWMA-smoothed over time, then **renormalized across the event's buckets** —
+  mutually exclusive temperature ranges must sum to 100%, so dividing by the
+  event's actual sum strips the structural overround / longshot bias. Books
+  too wide to mean anything produce no estimate at all.
+- **Entry:** every market is priced on both sides as a taker (YES at the ask,
+  NO at `100 − bid`), **including Kalshi's taker fee**. Sides with at least
+  **+2¢ net edge** (estimate vs all-in cost) are ranked by **expected
+  log-growth of the bankroll**, and the single best one is bought.
+- **Size:** the configured bankroll fraction (default **1/3**), automatically
+  **capped at the trade's Kelly fraction** (thin edges deploy less) and by the
+  order book's visible depth on both the entry and exit sides.
+- **Exit:** two self-tuning rules — **liquidity** (sell right before the exit
+  side's resting depth runs out: depth ≤ 2× position) and **edge reversal**
+  (sell when the market's bid overprices the held side by ≥ 3¢ net of the exit
+  fee — cashing out beats holding, win or lose). A position that hits neither
+  **rides through close and settles**. Sells are only ever attempted while the
+  book has a bid; an exited market is not re-entered for 5 minutes.
 - **Concurrency:** up to **`MAX_POSITIONS`** positions at once (default 1). A
-  position whose market has no exit liquidity (no YES bid) doesn't consume a slot,
-  so a stuck position can't block new trades.
-- **Settlement:** a position that hits neither exit simply **rides through
-  market close and settles** (there is no forced sell before close).
-- **Fast data:** market data is refreshed continuously via a 1s REST scan plus a
-  realtime WebSocket ticker feed.
+  position with no exit liquidity doesn't consume a slot, so a stuck position
+  can't block new trades.
+- **Fast data:** a continuous REST scan plus a realtime WebSocket ticker feed;
+  order books are fetched on a budgeted, prefiltered schedule so the bot never
+  bursts past API rate limits.
 
 > ⚠️ **Financial risk.** This software places real orders when configured to do
 > so. It ships in **demo + dry-run (paper)** mode by default. Read the Safety
@@ -34,27 +41,30 @@ simple, fully-specified rule set:
 ## How the strategy works
 
 ```
-                 ┌─────────── scan temperature markets (REST, every ~5s) ───────────┐
-                 │            overlay realtime prices (WebSocket ticker)             │
-                 ▼                                                                   │
-   IDLE ──find candidate──▶ BUYING ──filled──▶ HOLDING ──bid depth low──▶ IDLE      │
-    ▲   (vol ≥ 2/3 max &     (limit buy at      (watch order-book                    │
-    │    est. chance in       the ask, capped    bid depth; stop-loss)                │
-    │    90–95% band)         at band max)          │                                 │
-    └────────────────────────── sold / settled ◀────┘                                │
+              ┌────────── scan temperature markets (REST + WebSocket) ──────────┐
+              ▼                                                                  │
+   estimate true probability            pick the single best side               │
+   ───────────────────────────         ───────────────────────────              │
+   order-book microprice                YES @ ask  /  NO @ 100−bid              │
+   → EWMA smoothing            ──▶      net edge ≥ 2¢ (fees included)   ──▶  BUY (Kelly-capped size)
+   → event renormalization              max expected log-growth                  │
+                                                                                 ▼
+        settle through close  ◀── neither exit hit ──  HOLDING ── depth ≤ 2× position → SELL
+                                                          │
+                                                          └── bid overprices side ≥ 3¢ → SELL
 ```
 
-**"Maximum volume" is a single range market**, *not* an event aggregate. For
-example, for "High in New York" on a given day there are many bucket markets
-(…, 72–73°, 74–75°, …); the bot compares each bucket's own volume against the
-**highest-volume single bucket**, not against the summed volume of the whole NY
-event. By default this comparison is **global** (`global` scope): every
-monitored range market is measured against the single highest-volume range
-market across all monitored markets. Set `MAX_VOLUME_SCOPE=event` to instead
-compare within each event (one city/day).
+**Why renormalization is the edge:** each temperature event's buckets are
+mutually exclusive and exhaustive, so their true probabilities sum to exactly
+100%. Quoted books usually sum to more (overround) — and not uniformly: thin
+favorites/longshots are mispriced most. Renormalizing the microprice across
+the event recovers a calibrated probability and exposes which *individual
+buckets* are over- or under-priced — on either side.
 
-Because only one trade runs at a time, when several markets qualify the bot
-enters the **highest-volume** one.
+**Why expected log-growth (not raw edge) ranks trades:** a 2¢ edge on a 20¢
+contract is far more valuable per dollar than a 2¢ edge on a 94¢ contract, but
+also more volatile. Log-growth at the actually-deployed fraction weighs both
+correctly, and the Kelly cap keeps a thin edge from ever being over-bet.
 
 ---
 
@@ -83,8 +93,8 @@ Series tickers drift over time, so confirm them before running:
 python -m kalshi_temp_bot list-markets --series KXHIGHNY
 ```
 
-This prints every open market with its volume / bid / ask and flags which ones
-currently satisfy the buy rule. Put the tickers you want into
+This prints every open market with its volume / bid / ask / estimated chance
+and each market's best side + edge. Put the tickers you want into
 `TEMPERATURE_SERIES` in `.env`.
 
 ## Run
@@ -96,8 +106,9 @@ python -m kalshi_temp_bot gui
 ```
 
 A control panel with a **Dashboard** (Start/Stop, live state/position/balance,
-streaming log) and a **Settings** tab (every knob, saved per-user). It starts in
-paper mode; flip *Dry run* off and provide credentials to trade live.
+streaming log) and a **Settings** tab (the handful of operator choices, saved
+per-user). It starts in paper mode; flip *Dry run* off and provide credentials
+to trade live.
 
 **Windows installer:** `build_windows.bat` produces `KalshiTempBotSetup.exe`,
 which installs a standalone app (no Python needed), a **Desktop shortcut**, and a
@@ -134,84 +145,75 @@ network access.
 
 ## Configuration reference
 
-All settings are environment variables (see `.env.example`). Highlights:
+Only operator-level choices are configurable (see `.env.example`); the
+probability model, edge thresholds, exit rules and timing are self-tuned.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `KALSHI_ENV` | `demo` | `demo` or `prod` |
 | `DRY_RUN` | `true` | `true` = paper trade (no real orders) |
+| `KALSHI_API_KEY_ID` / `KALSHI_PRIVATE_KEY_PATH` | — | API credentials (live trading) |
 | `TEMPERATURE_SERIES` | built-in list | comma-separated series tickers to monitor |
-| `BUY_CHANCE_MIN_CENTS` | `90` | bottom of the buy band for the estimated chance (¢ = %) |
-| `BUY_CHANCE_MAX_CENTS` | `95` | top of the buy band (legacy `BUY_CHANCE_CENTS`/`BUY_YES_PRICE_CENTS` seed both) |
-| `MAX_SPREAD_CENTS` | `5` | ignore markets whose bid/ask spread is wider than this |
-| `CHANCE_SMOOTHING_SECONDS` | `30` | EWMA half-life for the microprice estimate |
-| `LIQUIDITY_EXIT_BUFFER` | `2.0` | sell when YES-bid depth ≤ this × position size |
-| `LIQUIDITY_POLL_SECONDS` | `5.0` | order-book depth poll cadence per held position |
-| `MIN_SELL_PRICE_CENTS` | `0` | stop-loss: sell if YES bid ≤ this (`0` = off; never fires on an empty book) |
+| `PORTFOLIO_FRACTION` | `0.3333` | max bankroll fraction per trade (Kelly may deploy less) |
 | `MAX_POSITIONS` | `1` | max concurrent positions (no-liquidity ones don't count) |
-| `VOLUME_THRESHOLD_RATIO` | `0.6667` | fraction of max volume required (2/3) |
-| `PORTFOLIO_FRACTION` | `0.3333` | fraction of portfolio per trade (1/3) |
-| `MAX_VOLUME_SCOPE` | `global` | `global` or `event` volume comparison |
-| `POLL_INTERVAL_SECONDS` | `1.0` | decision-loop cadence |
-| `SCAN_INTERVAL_SECONDS` | `5.0` | REST market re-scan cadence |
-| `USE_WEBSOCKET` | `true` | realtime ticker updates |
-| `MIN_SECONDS_TO_CLOSE` | `300` | don't enter markets closing this soon |
+| `PAPER_BALANCE_CENTS` | `100000` | sizing balance while paper trading without credentials |
 | `KALSHI_ORDER_API` | `v2` | `v2` (current) or `legacy` order endpoint |
+
+Fixed, self-tuned internals (for the curious): minimum net edge **2¢**; edge
+reversal exit **3¢**; liquidity exit at **2×** position depth; EWMA half-life
+**20 s**; estimates stale after **60 s**; spreads wider than **20¢** carry no
+information; book-level weight halves every **3¢** from the touch; taker fee
+**0.07·P·(1−P)**; books polled every **5 s** (3 fetches/tick budget); no entry
+within **5 min** of close; **5 min** re-entry cooldown after an exit; buy
+orders cancelled after **30 s** unfilled.
 
 ---
 
 ## Design notes & interpretations
 
-A few points in the spec needed a concrete reading; these are the choices made
-(all configurable):
-
-- **"Chance" = an estimate of what the market genuinely believes**, not the
-  number Kalshi displays (that's just the last trade, which can be stale or
-  moved by a single contract). The estimate is the order book's depth-weighted
-  midpoint (Stoikov microprice — heavy bidding pressure pulls it toward the
-  ask), smoothed with an EWMA (`CHANCE_SMOOTHING_SECONDS` half-life), then
-  renormalized by the sum of the event's bucket midpoints, since mutually
-  exclusive buckets must truly sum to 100% (this strips the structural
-  overround / longshot bias). Markets whose spread exceeds `MAX_SPREAD_CENTS`
-  are skipped entirely — a wide book carries no probability information. The
-  entry order is a limit at the YES ask, capped at the top of the band, so the
-  bot never pays more than `BUY_CHANCE_MAX_CENTS`.
-- **Liquidity exit:** while holding, the bot polls the market's order book and
-  sums the resting YES-bid quantity. When that depth falls to or below
-  `LIQUIDITY_EXIT_BUFFER × position size`, it sells immediately — capturing the
-  ride up while there is still enough liquidity left to actually fill the exit.
-- **"Portfolio" = available cash balance.** Since only one trade runs and it
-  starts from cash, the cash balance equals portfolio value at entry.
+- **"True probability" is estimated, not displayed.** The number Kalshi shows
+  is just the last trade — stale and movable by a single contract. The bot's
+  estimate comes from the whole order book (depth-weighted microprice),
+  smoothed over time, and disciplined by the event-level constraint that
+  bucket probabilities must sum to 100%.
+- **NO is a first-class side.** A bucket whose YES is overpriced is exactly a
+  bucket whose NO is underpriced; the bot prices both sides of every market
+  and the edge math (including fees) decides. NO orders are expressed to the
+  exchange as their YES-equivalents (buy NO at `q` = sell YES at `100−q`) on
+  Kalshi's unified book.
+- **Fees are part of the price.** Kalshi's taker fee (`0.07·P·(1−P)` per
+  contract) is added to the entry cost and subtracted from exit value before
+  any edge comparison — a "2¢ edge" is 2¢ *after* fees.
+- **"Portfolio" = available cash balance**, refreshed at each entry.
 - **Market close:** positions are deliberately carried through close and left
-  to settle; only the liquidity exit and the stop-loss ever sell.
-- **Force-sell mechanism** (used by those exits): a market order on the legacy
+  to settle; only the liquidity and edge-reversal exits ever sell.
+- **Force-sell mechanism** (used by the exits): a market order on the legacy
   API, or — since the v2 schema requires a price — an aggressive
-  immediate-or-cancel sell at the 1¢ floor, which sweeps all resting bids
-  (best price first) to flatten the position.
-- **Entry order** is a good-till-canceled limit buy at the ask (capped at the
-  band max), sized to 1/3 of the portfolio; partial fills are kept and managed,
-  and an unfilled order is cancelled after `BUY_TIMEOUT_SECONDS`.
-- **Restart safety:** on startup (live mode) the bot adopts any existing YES
-  position and resumes managing it across restarts.
+  immediate-or-cancel at the book's edge, which sweeps all resting bids.
+- **Entry order** is a good-till-canceled limit at the side's current ask,
+  sized to the Kelly-capped fraction and the book's visible depth; partial
+  fills are kept and managed, and an unfilled order is cancelled after 30 s.
+- **Restart safety:** on startup (live mode) the bot adopts any existing
+  position — YES or NO — and resumes managing it across restarts.
 
 ## Project layout
 
 ```
 kalshi_temp_bot/
-  config.py         env-driven configuration (+ per-user settings save)
+  config.py         operator-level configuration (+ per-user settings save)
   paths.py          per-user config directory (%APPDATA% / ~/.config)
-  money.py          dollar/cent/fixed-point unit helpers
+  money.py          dollar/cent unit helpers + order-book summaries
   kalshi_client.py  REST client + RSA request signing + order schemas
   kalshi_ws.py      realtime WebSocket ticker feed (optional accelerator)
-  strategy.py       pure, tested decision logic
-  bot.py            the IDLE→BUYING→HOLDING→EXITING state machine
+  strategy.py       pure, tested decision logic (estimator, edge, growth)
+  bot.py            the BUYING→HOLDING→EXITING loop around the strategy
   factory.py        builds a wired bot from config (shared by CLI + GUI)
   gui.py            Tkinter desktop GUI
   main.py           CLI (run / list-markets / balance / gui)
 gui_app.py          PyInstaller entry point for the GUI
 kalshi_temp_bot.spec / build_windows.bat / installer/  Windows packaging
 assets/make_icon.py generates the app icon
-tests/              strategy & money unit tests
+tests/              strategy, bot-loop & money unit tests
 ```
 
 ## Disclaimer

@@ -25,8 +25,9 @@ def _make_bot(client):
     cfg = Config.from_env()
     cfg.dry_run = True
     cfg.temperature_series = ["A"]      # one series -> one request per scan
-    cfg.scan_interval_seconds = 5.0
-    return TradingBot(client=client, config=cfg)
+    bot = TradingBot(client=client, config=cfg)
+    bot.scan_interval = 5.0
+    return bot
 
 
 def test_empty_scan_is_throttled_not_repeated(monkeypatch):

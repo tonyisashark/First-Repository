@@ -99,28 +99,42 @@ def _orderbook_levels(orderbook: dict, side: str):
             yield price, qty
 
 
-def orderbook_best_levels(orderbook: dict) -> dict:
-    """Best YES bid/ask price and quantity from an orderbook, in cents.
+def orderbook_summary(orderbook: dict, decay_cents: float = 3.0) -> dict:
+    """Best YES bid/ask plus depth measures from a full orderbook, in cents.
 
     The book's ``yes`` side holds resting YES buys (bids). The YES *ask* side is
     derived from resting NO buys: a NO bid at ``q`` cents is an offer to take
     the other side of YES at ``100 - q``, so the best YES ask is ``100 - best
-    NO bid``. Returns ``{"bid": price|None, "bid_qty": float, "ask": price|None,
-    "ask_qty": float}``.
+    NO bid``.
+
+    Two depth measures per side:
+      * effective depth (``bid_eff``/``ask_eff``): level quantities weighted by
+        ``0.5 ** (distance_from_best / decay_cents)`` -- pressure near the touch
+        dominates, deeper levels still count;
+      * raw totals (``yes_total``/``no_total``): everything resting on the
+        side, i.e. how many contracts a sweep could fill against.
     """
-    best_bid, bid_qty = None, 0.0
-    for price, qty in _orderbook_levels(orderbook, "yes"):
-        if best_bid is None or price > best_bid:
-            best_bid, bid_qty = price, qty
-    best_no, no_qty = None, 0.0
-    for price, qty in _orderbook_levels(orderbook, "no"):
-        if best_no is None or price > best_no:
-            best_no, no_qty = price, qty
+    yes_levels = list(_orderbook_levels(orderbook, "yes"))
+    no_levels = list(_orderbook_levels(orderbook, "no"))
+
+    best_bid = max((p for p, _ in yes_levels), default=None)
+    best_no = max((p for p, _ in no_levels), default=None)
+    best_ask = (100 - best_no) if best_no is not None else None
+
+    bid_eff = sum(
+        qty * 0.5 ** ((best_bid - price) / decay_cents) for price, qty in yes_levels
+    ) if best_bid is not None else 0.0
+    ask_eff = sum(
+        qty * 0.5 ** (((100 - price) - best_ask) / decay_cents) for price, qty in no_levels
+    ) if best_ask is not None else 0.0
+
     return {
         "bid": best_bid,
-        "bid_qty": bid_qty,
-        "ask": (100 - best_no) if best_no is not None else None,
-        "ask_qty": no_qty,
+        "ask": best_ask,
+        "bid_eff": bid_eff,
+        "ask_eff": ask_eff,
+        "yes_total": sum(qty for _, qty in yes_levels),
+        "no_total": sum(qty for _, qty in no_levels),
     }
 
 

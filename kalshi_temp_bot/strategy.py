@@ -4,31 +4,66 @@ Keeping the decision making here (separate from API/IO) makes it unit-testable.
 
 Strategy summary
 ----------------
-* Universe: daily-temperature *range* markets (one bucket = one market).
-* Buy candidate: a market whose volume is >= 2/3 of the maximum-volume market
-  AND whose *estimated chance* falls inside the configured [min, max] band.
-* The chance estimate is built from market data rather than the raw displayed
-  number (the last trade), which is noisy and can be stale:
-    1. base  = depth-weighted midpoint ("microprice") of the order book when
-       book depth is known, else the plain bid/ask midpoint;
-    2. it is renormalized across the event: the buckets of one event are
-       mutually exclusive and exhaustive, so their probabilities must sum to
-       100% -- dividing by the event's actual mid-sum removes the structural
-       overround (longshot bias);
-    3. a maximum bid/ask spread gate rejects markets whose book is too wide to
-       mean anything ("85 bid / 99 ask" is not a 92% belief).
-  Smoothing of the microprice over time (EWMA) is the bot loop's job, since it
-  needs state; the smoothed value is passed in via ``micro_estimates``.
-* The "maximum volume" is the single highest-volume **range** market -- not an
-  event-aggregate total.  Among all candidates the single best (highest volume)
-  is entered.
+The bot estimates each market's *true* probability purely from market data and
+then takes whichever side of whichever market offers the largest risk-adjusted
+edge -- YES or NO.
+
+1. Probability estimate (maximized accuracy from market data alone):
+   * base   = depth-weighted order-book midpoint over *all* levels (a
+     multi-level Stoikov microprice: resting pressure near the touch pulls the
+     estimate toward the opposite quote, deeper levels count with exponentially
+     decaying weight);
+   * smooth = EWMA over time (the bot loop owns the state), so one spoofed or
+     transient quote cannot move the estimate by itself;
+   * renorm = the buckets of one event are mutually exclusive and exhaustive,
+     so their probabilities must sum to 100%; dividing by the event's actual
+     estimate-sum strips the structural overround / longshot bias;
+   * gate   = a book wider than ``MAX_INFORMATIVE_SPREAD_CENTS`` carries no
+     probability information and produces no estimate at all.
+
+2. Edge: for each market, both sides are priced as a taker --
+   YES at the ask, NO at ``100 - bid`` -- including Kalshi's taker fee
+   (``0.07 * P * (1-P)`` per contract). ``edge = estimate - all-in cost``.
+
+3. Selection: among sides with ``edge >= MIN_EDGE_CENTS``, rank by expected
+   log-growth of the bankroll at the fraction that will actually be deployed
+   (the configured portfolio fraction, capped at the Kelly fraction so a thin
+   edge is never over-bet). The single highest-growth side is bought.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+
+# --- self-tuned constants (chosen from market structure, not user input) -----
+# Kalshi's taker fee: 0.07 * price * (1 - price) dollars per contract.
+TAKER_FEE_RATE = 0.07
+# Minimum net edge (cents) required to trade: covers estimate noise so the bot
+# only acts when the model and the price genuinely disagree.
+MIN_EDGE_CENTS = 2.0
+# Exit a held position when the market's bid overprices our side by this much
+# (net of the exit fee) -- the model says cashing out now beats holding.
+EXIT_EDGE_CENTS = 3.0
+# A book wider than this carries no probability information -> no estimate.
+MAX_INFORMATIVE_SPREAD_CENTS = 20
+# An event's bucket estimates should sum to ~100 cents. Renormalize only when
+# the sum is plausibly complete; far outside this window the data is suspect
+# (buckets missing from the scan), so the raw estimate is safer.
+RENORM_SUM_MIN = 80.0
+RENORM_SUM_MAX = 125.0
+# Order-book level weighting: a level's quantity counts at half weight for
+# every 3 cents it sits away from the best price (the touch dominates, depth
+# behind it still matters).
+LEVEL_DECAY_CENTS = 3.0
+# EWMA half-life for smoothing the microprice estimate over time.
+EWMA_HALF_LIFE_SECONDS = 20.0
+# A book-based estimate older than this is stale and is not used.
+ESTIMATE_MAX_AGE_SECONDS = 60.0
+# Never open a position in a market closing sooner than this.
+MIN_SECONDS_TO_CLOSE = 300
 
 
 @dataclass
@@ -43,6 +78,20 @@ class MarketView:
     volume: float
     close_time: Optional[datetime]
     status: str = "open"
+
+
+@dataclass
+class TradeCandidate:
+    """One tradeable side of one market, with its edge and growth metrics."""
+
+    market: MarketView
+    side: str            # "yes" or "no"
+    price_cents: int     # taker price for this side (the side's ask)
+    chance_cents: float  # estimated probability this side wins (cents = %)
+    cost_cents: float    # price + taker fee
+    edge_cents: float    # chance - cost
+    fraction: float      # bankroll fraction to deploy (Kelly-capped)
+    growth: float        # expected log-growth per trade at ``fraction``
 
 
 def parse_time(value: Optional[str]) -> Optional[datetime]:
@@ -69,14 +118,7 @@ def seconds_to_close(market: MarketView, now: Optional[datetime] = None) -> Opti
     return (market.close_time - now).total_seconds()
 
 
-# An event's bucket mids should sum to ~100 cents. Renormalize only when the
-# sum is plausibly complete; far outside this window the data is suspect
-# (buckets missing from the scan, or a degenerate test universe), so the raw
-# estimate is safer than a wildly scaled one.
-RENORM_SUM_MIN = 80.0
-RENORM_SUM_MAX = 125.0
-
-
+# --- probability estimation --------------------------------------------------
 def mid_price_cents(market: MarketView) -> Optional[float]:
     """Bid/ask midpoint in cents. A missing bid counts as 0 (an empty bid side
     is a real statement, not missing data); no ask means no tradeable price."""
@@ -87,10 +129,16 @@ def mid_price_cents(market: MarketView) -> Optional[float]:
 
 def spread_cents(market: MarketView) -> Optional[int]:
     """Bid/ask spread in cents (missing bid counts as 0, so pinned/one-sided
-    books show a huge spread and get rejected by the spread gate)."""
+    books show a huge spread and are treated as uninformative)."""
     if market.yes_ask is None:
         return None
     return market.yes_ask - (market.yes_bid or 0)
+
+
+def informative(market: MarketView) -> bool:
+    """True when the book is tight enough to carry probability information."""
+    spread = spread_cents(market)
+    return spread is not None and spread <= MAX_INFORMATIVE_SPREAD_CENTS
 
 
 def microprice_cents(
@@ -112,202 +160,205 @@ def microprice_cents(
     return (yes_ask * bid_depth + yes_bid * ask_depth) / (bid_depth + ask_depth)
 
 
-def event_mid_sums(markets: List[MarketView]) -> Dict[str, float]:
-    """Sum of bucket midpoints per event -- the event's actual "overround"."""
+def renormalized_estimates(
+    markets: List[MarketView],
+    raw_estimates: Dict[str, float],
+) -> Dict[str, float]:
+    """Final per-ticker probability estimates (cents), renormalized per event.
+
+    ``raw_estimates`` maps ticker -> smoothed microprice for markets where the
+    bot has order-book data. Buckets without one contribute their plain midpoint
+    to the event sum (every bucket must be counted for the sum to mean
+    anything), but only book-backed tickers receive a final estimate.
+    Uninformative (wide-spread) books contribute nothing and get nothing.
+    """
     sums: Dict[str, float] = {}
     for market in markets:
-        mid = mid_price_cents(market)
-        if mid is None:
-            continue
-        sums[market.event_ticker] = sums.get(market.event_ticker, 0.0) + mid
-    return sums
+        value = raw_estimates.get(market.ticker)
+        if value is None:
+            value = mid_price_cents(market) if informative(market) else None
+        if value is not None:
+            sums[market.event_ticker] = sums.get(market.event_ticker, 0.0) + value
 
-
-def estimate_chance_cents(
-    market: MarketView,
-    event_sums: Dict[str, float],
-    micro: Optional[float] = None,
-) -> Optional[float]:
-    """The market's estimated true chance in cents (= percent).
-
-    ``micro`` is an externally computed (typically EWMA-smoothed) microprice for
-    this market; without one the bid/ask midpoint is used. The base estimate is
-    renormalized by its event's bucket-mid sum when that sum looks complete.
-    """
-    base = micro if micro is not None else mid_price_cents(market)
-    if base is None:
-        return None
-    total = event_sums.get(market.event_ticker, 0.0)
-    if RENORM_SUM_MIN <= total <= RENORM_SUM_MAX:
-        return base * 100.0 / total
-    return base
-
-
-def has_liquidity(market: MarketView) -> bool:
-    """True if the YES ask is a real, tradeable price (strictly between the rails).
-
-    A bucket pinned at 0/1c (settled loser) or 99/100c (settled winner) has no
-    meaningful two-sided liquidity, so it shouldn't be surfaced as a near-target
-    market.
-    """
-    return market.yes_ask is not None and 1 < market.yes_ask < 99
-
-
-def _group_markets(markets: List[MarketView], scope: str) -> Dict[str, List[MarketView]]:
-    groups: Dict[str, List[MarketView]] = {}
+    final: Dict[str, float] = {}
     for market in markets:
-        key = "__global__" if scope == "global" else market.event_ticker
-        groups.setdefault(key, []).append(market)
-    return groups
+        value = raw_estimates.get(market.ticker)
+        if value is None:
+            continue
+        total = sums.get(market.event_ticker, 0.0)
+        if RENORM_SUM_MIN <= total <= RENORM_SUM_MAX:
+            value = value * 100.0 / total
+        final[market.ticker] = min(99.0, max(1.0, value))
+    return final
 
 
-def volume_qualifying_markets(
+# --- edge / growth mathematics ------------------------------------------------
+def taker_fee_cents(price_cents: float) -> float:
+    """Kalshi taker fee per contract, in cents: ``0.07 * P * (1-P)`` dollars."""
+    return TAKER_FEE_RATE * price_cents * (100.0 - price_cents) / 100.0
+
+
+def kelly_fraction(chance_cents: float, cost_cents: float) -> float:
+    """Kelly-optimal bankroll fraction for a binary contract.
+
+    Buying at all-in cost ``a`` (cents) with win probability ``p`` (cents),
+    the log-growth-optimal fraction is ``(p - a) / (100 - a)``.
+    """
+    if cost_cents >= 100.0:
+        return 0.0
+    return max(0.0, (chance_cents - cost_cents) / (100.0 - cost_cents))
+
+
+def growth_rate(chance_cents: float, cost_cents: float, fraction: float) -> float:
+    """Expected log-growth of the bankroll for one trade at ``fraction``.
+
+    ``p*ln(1 + f*(100-a)/a) + (1-p)*ln(1-f)`` -- the compounding-correct value
+    of the bet: positive only when the edge genuinely beats the risk taken.
+    """
+    if fraction <= 0.0 or cost_cents <= 0.0 or cost_cents >= 100.0:
+        return 0.0
+    fraction = min(fraction, 0.99)
+    p = min(0.999, max(0.001, chance_cents / 100.0))
+    win = 1.0 + fraction * (100.0 - cost_cents) / cost_cents
+    return p * math.log(win) + (1.0 - p) * math.log(1.0 - fraction)
+
+
+def side_quotes(market: MarketView, side: str) -> Dict[str, Optional[int]]:
+    """The bid/ask for one side, in that side's own terms.
+
+    NO quotes are the YES book mirrored: ``no_bid = 100 - yes_ask`` and
+    ``no_ask = 100 - yes_bid``.
+    """
+    if side == "yes":
+        return {"bid": market.yes_bid, "ask": market.yes_ask}
+    return {
+        "bid": (100 - market.yes_ask) if market.yes_ask is not None else None,
+        "ask": (100 - market.yes_bid) if market.yes_bid is not None else None,
+    }
+
+
+def evaluate_side(
+    market: MarketView,
+    side: str,
+    estimate_cents: float,
+    portfolio_fraction: float,
+) -> Optional[TradeCandidate]:
+    """Price one side of one market as a taker; ``None`` if it isn't tradeable."""
+    ask = side_quotes(market, side)["ask"]
+    if ask is None or not (1 <= ask <= 99):
+        return None
+    chance = estimate_cents if side == "yes" else 100.0 - estimate_cents
+    cost = ask + taker_fee_cents(ask)
+    edge = chance - cost
+    fraction = min(portfolio_fraction, kelly_fraction(chance, cost))
+    return TradeCandidate(
+        market=market,
+        side=side,
+        price_cents=ask,
+        chance_cents=chance,
+        cost_cents=cost,
+        edge_cents=edge,
+        fraction=fraction,
+        growth=growth_rate(chance, cost, fraction),
+    )
+
+
+def select_trade_candidates(
     markets: List[MarketView],
     *,
-    volume_threshold_ratio: float,
-    scope: str = "global",
-) -> List[MarketView]:
-    """Markets whose volume is >= ``volume_threshold_ratio`` of their group's
-    maximum-volume market (ignoring price). The shared volume filter used by both
-    the buy rule and the heartbeat."""
-    qualifying: List[MarketView] = []
-    for group in _group_markets(markets, scope).values():
-        volumes = [m.volume for m in group if m.volume is not None]
-        if not volumes:
-            continue
-        max_volume = max(volumes)
-        if max_volume <= 0:
-            continue
-        threshold = volume_threshold_ratio * max_volume
-        qualifying.extend(m for m in group if m.volume is not None and m.volume >= threshold)
-    return qualifying
-
-
-def select_buy_candidates(
-    markets: List[MarketView],
-    *,
-    min_chance_cents: int,
-    max_chance_cents: int,
-    volume_threshold_ratio: float,
-    scope: str = "global",
-    min_seconds_to_close: Optional[int] = None,
-    max_spread_cents: Optional[int] = None,
-    micro_estimates: Optional[Dict[str, float]] = None,
+    estimates: Dict[str, float],
+    portfolio_fraction: float,
+    min_edge_cents: float = MIN_EDGE_CENTS,
+    min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE,
     now: Optional[datetime] = None,
-) -> List[MarketView]:
-    """Return every market that satisfies the buy rule.
+) -> List[TradeCandidate]:
+    """Every market side worth taking: edge >= the minimum and positive growth.
 
-    A market qualifies when, within its volume-comparison group, its volume is
-    ``>= volume_threshold_ratio * max_group_volume``, its bid/ask spread is at
-    most ``max_spread_cents`` (when set), and its estimated chance (see
-    :func:`estimate_chance_cents`) lies inside
-    ``[min_chance_cents, max_chance_cents]`` inclusive.
-
-    ``micro_estimates`` maps ticker -> smoothed microprice in cents for markets
-    where the bot has order-book data; other markets fall back to the midpoint.
-
-    ``scope`` controls the comparison group for "maximum volume":
-      * ``"global"`` -> compared against the single highest-volume range market
-        across every monitored market at once -- the default.
-      * ``"event"``  -> compared against other range markets in the same event
-        (same city/day).
+    ``estimates`` is the output of :func:`renormalized_estimates` -- only
+    tickers with a (book-backed, fresh) estimate are eligible at all.
     """
     now = now or datetime.now(timezone.utc)
-    micro_estimates = micro_estimates or {}
-    event_sums = event_mid_sums(markets)
-
-    candidates: List[MarketView] = []
-    for market in volume_qualifying_markets(
-        markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
-    ):
-        if max_spread_cents is not None:
-            spread = spread_cents(market)
-            if spread is None or spread > max_spread_cents:
-                continue
-        chance = estimate_chance_cents(market, event_sums, micro_estimates.get(market.ticker))
-        if chance is None or not (min_chance_cents <= chance <= max_chance_cents):
+    candidates: List[TradeCandidate] = []
+    for market in markets:
+        estimate = estimates.get(market.ticker)
+        if estimate is None:
             continue
-        if min_seconds_to_close is not None:
-            stc = seconds_to_close(market, now)
-            if stc is not None and stc < min_seconds_to_close:
+        stc = seconds_to_close(market, now)
+        if stc is not None and stc < min_seconds_to_close:
+            continue
+        for side in ("yes", "no"):
+            cand = evaluate_side(market, side, estimate, portfolio_fraction)
+            if cand is None:
                 continue
-        candidates.append(market)
+            if cand.edge_cents >= min_edge_cents and cand.growth > 0.0:
+                candidates.append(cand)
     return candidates
 
 
-def pick_best_candidate(candidates: List[MarketView]) -> Optional[MarketView]:
-    """Choose one market to trade (highest volume) since only one trade runs."""
+def best_candidate(candidates: List[TradeCandidate]) -> Optional[TradeCandidate]:
+    """The single highest expected-log-growth side -- the greatest true edge."""
     if not candidates:
         return None
-    return max(candidates, key=lambda m: m.volume)
+    return max(candidates, key=lambda c: c.growth)
 
 
-def position_size(balance_cents: int, portfolio_fraction: float, price_cents: int) -> int:
-    """Number of contracts to buy with ``portfolio_fraction`` of the balance.
+def position_size(balance_cents: int, fraction: float, price_cents: int) -> int:
+    """Number of contracts affordable with ``fraction`` of the balance.
 
     ``floor( (balance * fraction) / price )`` -- e.g. $300 balance, 1/3, 90c
     -> floor(10000 / 90) = 111 contracts.
     """
     if price_cents <= 0:
         return 0
-    budget_cents = int(balance_cents * portfolio_fraction)
+    budget_cents = int(balance_cents * fraction)
     return budget_cents // price_cents
 
 
 def idle_watch_summary(
     markets: List[MarketView],
     *,
-    min_chance_cents: int,
-    max_chance_cents: int,
-    volume_threshold_ratio: float,
-    scope: str = "global",
-    min_seconds_to_close: Optional[int] = None,
-    max_spread_cents: Optional[int] = None,
-    micro_estimates: Optional[Dict[str, float]] = None,
+    estimates: Dict[str, float],
+    portfolio_fraction: float,
     now: Optional[datetime] = None,
 ) -> str:
-    """One-line, human-readable summary of what the bot is watching while idle.
+    """One-line, human-readable summary of what the bot sees while idle.
 
-    Reports how many markets/events are tracked, how many currently fall in the
-    buy band, and (if none do) the volume-qualifying market whose estimated
-    chance is closest to the band -- i.e. how close the bot is to triggering.
+    Reports the universe size, how many sides currently clear the edge bar,
+    and the best edge on offer (even when it is below the bar, so the operator
+    can see how close the bot is to acting).
     """
     if not markets:
         return "watching 0 markets -- check Environment=prod and the series tickers"
 
     now = now or datetime.now(timezone.utc)
     n_events = len({m.event_ticker for m in markets})
-    candidates = select_buy_candidates(
-        markets,
-        min_chance_cents=min_chance_cents,
-        max_chance_cents=max_chance_cents,
-        volume_threshold_ratio=volume_threshold_ratio,
-        scope=scope,
-        min_seconds_to_close=min_seconds_to_close,
-        max_spread_cents=max_spread_cents,
-        micro_estimates=micro_estimates,
-        now=now,
-    )
-    parts = [
-        f"watching {len(markets)} markets / {n_events} events",
-        f"{len(candidates)} in {min_chance_cents}-{max_chance_cents}% chance band",
-    ]
-    # Only consider markets with real liquidity (ignore rail-priced 0/1/99/100
-    # buckets) and a known estimate when reporting the closest market to the band.
-    event_sums = event_mid_sums(markets)
-    micro_estimates = micro_estimates or {}
-    qualifying = [
-        (m, estimate_chance_cents(m, event_sums, micro_estimates.get(m.ticker)))
-        for m in volume_qualifying_markets(
-            markets, volume_threshold_ratio=volume_threshold_ratio, scope=scope
-        )
-        if has_liquidity(m)
-    ]
-    qualifying = [(m, c) for m, c in qualifying if c is not None]
-    if qualifying and not candidates:
-        def distance(chance: float) -> float:
-            return max(min_chance_cents - chance, chance - max_chance_cents, 0.0)
+    head = f"watching {len(markets)} markets / {n_events} events ({len(estimates)} estimated)"
 
-        closest, chance = min(qualifying, key=lambda pair: distance(pair[1]))
-        parts.append(f"closest qualifying {closest.ticker} chance {chance:.1f}%")
-    return " | ".join(parts)
+    candidates = select_trade_candidates(
+        markets, estimates=estimates, portfolio_fraction=portfolio_fraction, now=now,
+    )
+    if candidates:
+        best = best_candidate(candidates)
+        return (
+            f"{head} | {len(candidates)} side(s) above the edge bar | best: "
+            f"{best.market.ticker} {best.side.upper()} est {best.chance_cents:.1f}% "
+            f"@ {best.price_cents}c edge {best.edge_cents:+.1f}c"
+        )
+
+    # Nothing clears the bar -- show the closest miss so progress is visible.
+    near: Optional[TradeCandidate] = None
+    for market in markets:
+        estimate = estimates.get(market.ticker)
+        if estimate is None:
+            continue
+        for side in ("yes", "no"):
+            cand = evaluate_side(market, side, estimate, portfolio_fraction)
+            if cand is not None and (near is None or cand.edge_cents > near.edge_cents):
+                near = cand
+    if near is None:
+        return f"{head} | no tradeable book estimates yet"
+    return (
+        f"{head} | no side above the +{MIN_EDGE_CENTS:.0f}c edge bar | closest: "
+        f"{near.market.ticker} {near.side.upper()} est {near.chance_cents:.1f}% "
+        f"@ {near.price_cents}c edge {near.edge_cents:+.1f}c"
+    )

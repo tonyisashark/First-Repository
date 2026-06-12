@@ -31,30 +31,17 @@ logger = logging.getLogger("kalshi_temp_bot")
 APP_TITLE = "Kalshi Temperature Trading Bot"
 
 # (env key, label, kind, choices) -- drives both the Settings form and saving.
+# Only operator-level choices live here; the probability model, edge thresholds
+# and timing are self-tuned inside the strategy and need no input.
 SETTINGS_FIELDS = [
     ("KALSHI_ENV", "Environment", "choice", ["demo", "prod"]),
     ("DRY_RUN", "Dry run (paper trading -- no real orders)", "bool", None),
     ("KALSHI_API_KEY_ID", "API Key ID", "text", None),
     ("KALSHI_PRIVATE_KEY_PATH", "Private key (.pem) path", "file", None),
     ("TEMPERATURE_SERIES", "Temperature series (comma-separated, blank = defaults)", "text", None),
-    ("BUY_CHANCE_MIN_CENTS", "Buy chance band: min (% = cents)", "text", None),
-    ("BUY_CHANCE_MAX_CENTS", "Buy chance band: max (% = cents)", "text", None),
-    ("MAX_SPREAD_CENTS", "Ignore markets with spread > (cents)", "text", None),
-    ("CHANCE_SMOOTHING_SECONDS", "Chance smoothing half-life (s)", "text", None),
-    ("LIQUIDITY_EXIT_BUFFER", "Sell when bid depth <= (x position size)", "text", None),
-    ("LIQUIDITY_POLL_SECONDS", "Order-book depth poll interval (s)", "text", None),
-    ("MIN_SELL_PRICE_CENTS", "Stop-loss: sell if bid <= (cents, 0=off)", "text", None),
+    ("PORTFOLIO_FRACTION", "Max bankroll fraction per trade (1/3)", "text", None),
     ("MAX_POSITIONS", "Max concurrent positions", "text", None),
-    ("VOLUME_THRESHOLD_RATIO", "Volume threshold ratio (2/3)", "text", None),
-    ("PORTFOLIO_FRACTION", "Portfolio fraction per trade (1/3)", "text", None),
-    ("MAX_VOLUME_SCOPE", "Max-volume comparison scope", "choice", ["global", "event"]),
-    ("POLL_INTERVAL_SECONDS", "Decision poll interval (s)", "text", None),
-    ("SCAN_INTERVAL_SECONDS", "Market re-scan interval (s)", "text", None),
-    ("MIN_SECONDS_TO_CLOSE", "Don't enter if closing within (s)", "text", None),
-    ("BUY_TIMEOUT_SECONDS", "Cancel unfilled buy after (s)", "text", None),
-    ("HEARTBEAT_INTERVAL_SECONDS", "Heartbeat status log interval (s)", "text", None),
-    ("USE_WEBSOCKET", "Use realtime WebSocket feed", "bool", None),
-    ("KALSHI_ORDER_API", "Order API", "choice", ["v2", "legacy"]),
+    ("PAPER_BALANCE_CENTS", "Paper-trading balance (cents)", "text", None),
 ]
 
 
@@ -66,24 +53,9 @@ def cfg_to_env_values(cfg: Config) -> Dict[str, str]:
         "KALSHI_API_KEY_ID": cfg.api_key_id or "",
         "KALSHI_PRIVATE_KEY_PATH": cfg.private_key_path or "",
         "TEMPERATURE_SERIES": ",".join(cfg.temperature_series),
-        "BUY_CHANCE_MIN_CENTS": str(cfg.buy_chance_min_cents),
-        "BUY_CHANCE_MAX_CENTS": str(cfg.buy_chance_max_cents),
-        "MAX_SPREAD_CENTS": str(cfg.max_spread_cents),
-        "CHANCE_SMOOTHING_SECONDS": f"{cfg.chance_smoothing_seconds:g}",
-        "LIQUIDITY_EXIT_BUFFER": f"{cfg.liquidity_exit_buffer:.10g}",
-        "LIQUIDITY_POLL_SECONDS": f"{cfg.liquidity_poll_seconds:g}",
-        "MIN_SELL_PRICE_CENTS": str(cfg.min_sell_price_cents),
-        "MAX_POSITIONS": str(cfg.max_positions),
-        "VOLUME_THRESHOLD_RATIO": f"{cfg.volume_threshold_ratio:.10g}",
         "PORTFOLIO_FRACTION": f"{cfg.portfolio_fraction:.10g}",
-        "MAX_VOLUME_SCOPE": cfg.max_volume_scope,
-        "POLL_INTERVAL_SECONDS": f"{cfg.poll_interval_seconds:g}",
-        "SCAN_INTERVAL_SECONDS": f"{cfg.scan_interval_seconds:g}",
-        "MIN_SECONDS_TO_CLOSE": str(cfg.min_seconds_to_close),
-        "BUY_TIMEOUT_SECONDS": str(cfg.buy_timeout_seconds),
-        "HEARTBEAT_INTERVAL_SECONDS": f"{cfg.heartbeat_interval_seconds:g}",
-        "USE_WEBSOCKET": "true" if cfg.use_websocket else "false",
-        "KALSHI_ORDER_API": cfg.order_api,
+        "MAX_POSITIONS": str(cfg.max_positions),
+        "PAPER_BALANCE_CENTS": str(cfg.paper_balance_cents),
     }
 
 
@@ -392,7 +364,7 @@ class BotGUI:
             if not trades:
                 self.status_vars["position"].set("none")
             else:
-                shown = ", ".join(f"{t.ticker} x{t.count}" for t in trades[:2])
+                shown = ", ".join(f"{t.ticker} {t.side.upper()} x{t.count}" for t in trades[:2])
                 if len(trades) > 2:
                     shown += f" +{len(trades) - 2}"
                 self.status_vars["position"].set(

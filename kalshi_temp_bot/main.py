@@ -18,7 +18,13 @@ from . import money
 from .bot import TradingBot
 from .config import Config
 from .factory import build_auth, build_bot, build_client
-from .strategy import estimate_chance_cents, event_mid_sums, select_buy_candidates
+from .strategy import (
+    MIN_EDGE_CENTS,
+    evaluate_side,
+    informative,
+    mid_price_cents,
+    renormalized_estimates,
+)
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -70,33 +76,40 @@ def cmd_list_markets(cfg: Config, series_override: Optional[List[str]]) -> int:
         print("No open markets found. Verify your series tickers (TEMPERATURE_SERIES).")
         return 1
 
-    candidates = {
-        m.ticker
-        for m in select_buy_candidates(
-            views,
-            min_chance_cents=cfg.buy_chance_min_cents,
-            max_chance_cents=cfg.buy_chance_max_cents,
-            volume_threshold_ratio=cfg.volume_threshold_ratio,
-            scope=cfg.max_volume_scope,
-            min_seconds_to_close=cfg.min_seconds_to_close,
-            max_spread_cents=cfg.max_spread_cents,
-        )
+    # Snapshot estimates from the quoted mids (the live bot sharpens these with
+    # depth-weighted order-book data; this read-only view stays light).
+    mids = {
+        m.ticker: mid
+        for m in views
+        if informative(m) and (mid := mid_price_cents(m)) is not None
     }
-    event_sums = event_mid_sums(views)
+    estimates = renormalized_estimates(views, mids)
 
+    n_edges = 0
     views.sort(key=lambda m: (m.event_ticker, -m.volume))
-    print(f"{'BUY?':<5}{'TICKER':<28}{'EVENT':<22}{'VOL':>10}{'CHANCE':>8}{'YES_BID':>9}{'YES_ASK':>9}")
-    print("-" * 91)
+    print(f"{'EDGE?':<6}{'TICKER':<28}{'EVENT':<22}{'VOL':>10}{'EST':>7}{'YES_BID':>9}{'YES_ASK':>9}{'BEST_SIDE':>16}")
+    print("-" * 107)
     for m in views:
-        flag = "BUY" if m.ticker in candidates else ""
-        est = estimate_chance_cents(m, event_sums)
-        chance = "-" if est is None else f"{est:.1f}%"
+        est = estimates.get(m.ticker)
+        sides = []
+        if est is not None:
+            sides = [
+                c for s in ("yes", "no")
+                if (c := evaluate_side(m, s, est, cfg.portfolio_fraction)) is not None
+            ]
+        best = max(sides, key=lambda c: c.edge_cents) if sides else None
+        flag = ""
+        if best is not None and best.edge_cents >= MIN_EDGE_CENTS and best.growth > 0:
+            flag = "EDGE"
+            n_edges += 1
+        est_txt = "-" if est is None else f"{est:.1f}%"
         bid = "-" if m.yes_bid is None else str(m.yes_bid)
         ask = "-" if m.yes_ask is None else str(m.yes_ask)
-        print(f"{flag:<5}{m.ticker:<28}{m.event_ticker:<22}{m.volume:>10.0f}{chance:>8}{bid:>9}{ask:>9}")
-    print(f"\n{len(candidates)} candidate(s) match the buy rule "
-          f"(vol >= {cfg.volume_threshold_ratio:.2%} of event max, spread <= {cfg.max_spread_cents}c, "
-          f"estimated chance in {cfg.buy_chance_min_cents}-{cfg.buy_chance_max_cents}%).")
+        side_txt = "-" if best is None else f"{best.side.upper()} {best.edge_cents:+.1f}c"
+        print(f"{flag:<6}{m.ticker:<28}{m.event_ticker:<22}{m.volume:>10.0f}{est_txt:>7}{bid:>9}{ask:>9}{side_txt:>16}")
+    print(f"\n{n_edges} side(s) currently clear the +{MIN_EDGE_CENTS:.0f}c net-edge bar "
+          f"(estimate vs all-in taker cost, fees included; the live bot re-checks "
+          f"with depth-weighted order-book estimates before trading).")
     return 0
 
 

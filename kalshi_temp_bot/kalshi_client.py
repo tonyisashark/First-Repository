@@ -182,8 +182,16 @@ class KalshiClient:
         price_cents: Optional[int] = None,
         time_in_force: str = "good_till_canceled",
         market_order: bool = False,
+        side: str = "yes",
     ) -> dict:
-        """Place a YES order. ``is_buy`` True = buy YES, False = sell YES.
+        """Place an order on either side. ``is_buy``/``price_cents`` are in
+        ``side``'s own terms (e.g. buy NO at its 40c ask).
+
+        Kalshi's book is unified, so a NO order is expressed as its YES
+        equivalent: buying NO at ``q`` is selling YES at ``100 - q`` and vice
+        versa (the exchange nets an owned NO against a YES purchase
+        automatically). The conversion happens here so callers can think purely
+        in the side they trade.
 
         ``market_order`` requests immediate execution at any price: a real
         ``market`` order on the legacy schema, or -- since the v2 schema requires
@@ -193,6 +201,10 @@ class KalshiClient:
         Routes to the new ``/portfolio/events/orders`` schema by default, or the
         legacy ``/portfolio/orders`` schema when ``order_api == 'legacy'``.
         """
+        if side == "no":
+            is_buy = not is_buy
+            if price_cents is not None:
+                price_cents = 100 - price_cents
         if self.order_api == "legacy":
             body = {
                 "ticker": ticker,

@@ -42,7 +42,7 @@ def build_bot(cfg: Config) -> Tuple[TradingBot, Optional[KalshiAuth]]:
     client = build_client(cfg, auth)
     bot = TradingBot(client=client, config=cfg, cache=None, ws=None)
 
-    if cfg.use_websocket and auth is not None:
+    if auth is not None:
         cache = MarketDataCache()
         ws = KalshiWebSocket(
             ws_base=cfg.ws_base,
