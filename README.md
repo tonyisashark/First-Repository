@@ -166,9 +166,10 @@ Fixed, self-tuned internals (for the curious): minimum net edge **2¢**; edge
 reversal exit **3¢**; liquidity exit at **2×** position depth; EWMA half-life
 **20 s**; estimates stale after **60 s**; spreads wider than **20¢** carry no
 information; book-level weight halves every **3¢** from the touch; taker fee
-**0.07·P·(1−P)**; books polled every **5 s** (3 fetches/tick budget); no entry
-within **5 min** of close; **5 min** re-entry cooldown after an exit; buy
-orders cancelled after **30 s** unfilled.
+**0.07·P·(1−P)**; books polled every **5 s** (5 fetches/tick budget, tracking
+every market within **8¢** of the edge bar); no entry within **5 min** of
+close; **5 min** re-entry cooldown after an exit; buy orders cancelled after
+**30 s** unfilled.
 
 ---
 

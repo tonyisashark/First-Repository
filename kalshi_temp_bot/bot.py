@@ -83,11 +83,14 @@ REENTRY_COOLDOWN_SECONDS = 300.0
 # so a multi-city scan doesn't burst past Kalshi's rate limit.
 SERIES_REQUEST_SPACING = 0.15
 
-# Book fetches are the expensive part of estimation. Only markets whose cheap
-# mid-based edge is within this slack of the bar get a book look, at most this
-# many fetches per tick.
-PREFILTER_SLACK_CENTS = 3.0
-BOOK_FETCH_BUDGET_PER_TICK = 3
+# Book fetches are the expensive part of estimation. Markets whose cheap
+# mid-based edge is no more than this far BELOW the edge bar get tracked
+# (continuous book polls feed the EWMA, so by the time a real edge crosses the
+# bar the estimate has history behind it). A fairly-priced tight book sits
+# around -1 to -3c on this measure, so the slack must comfortably cover that.
+# Fetches are budgeted per tick so tracking can't burst past the rate limit.
+PREFILTER_SLACK_CENTS = 8.0
+BOOK_FETCH_BUDGET_PER_TICK = 5
 
 
 class TradeState(Enum):
@@ -356,6 +359,12 @@ class TradingBot:
         for market in markets:
             estimate = rough.get(market.ticker)
             if estimate is None:
+                continue
+            mid = mids.get(market.ticker)
+            if mid is None or not (3.0 <= mid <= 97.0):
+                # Rail-priced (settled-in-all-but-name) buckets: their NO side
+                # always *looks* near-edge on the mid but can never clear the
+                # bar net of fees -- don't let them crowd the fetch queue.
                 continue
             edges = [
                 cand.edge_cents

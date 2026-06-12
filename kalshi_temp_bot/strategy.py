@@ -354,9 +354,21 @@ def idle_watch_summary(
         )
 
     # Nothing clears the bar -- show the closest miss so progress is visible.
+    # Markets without a book-backed estimate fall back to their renormalized
+    # quoted mid (marked with ~) so the distance to the bar is always shown.
+    rough = renormalized_estimates(
+        markets,
+        {
+            m.ticker: mid
+            for m in markets
+            if informative(m) and (mid := mid_price_cents(m)) is not None
+        },
+    )
+    merged = dict(rough)
+    merged.update(estimates)
     near: Optional[TradeCandidate] = None
     for market in markets:
-        estimate = estimates.get(market.ticker)
+        estimate = merged.get(market.ticker)
         if estimate is None:
             continue
         for side in ("yes", "no"):
@@ -364,9 +376,10 @@ def idle_watch_summary(
             if cand is not None and (near is None or cand.edge_cents > near.edge_cents):
                 near = cand
     if near is None:
-        return f"{head} | no tradeable book estimates yet"
+        return f"{head} | books too wide or one-sided to estimate (off-hours lull?)"
+    approx = "" if near.market.ticker in estimates else "~"
     return (
         f"{head} | no side above the +{MIN_EDGE_CENTS:.0f}c edge bar | closest: "
-        f"{near.market.ticker} {near.side.upper()} est {near.chance_cents:.1f}% "
-        f"@ {near.price_cents}c edge {near.edge_cents:+.1f}c"
+        f"{near.market.ticker} {near.side.upper()} est {approx}{near.chance_cents:.1f}% "
+        f"@ {near.price_cents}c edge {approx}{near.edge_cents:+.1f}c"
     )

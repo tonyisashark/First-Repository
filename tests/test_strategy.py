@@ -275,10 +275,19 @@ def test_idle_summary_reports_closest_miss():
     assert "closest: A" in text
 
 
-def test_idle_summary_without_estimates():
-    markets = [mk("A", yes_bid=92, yes_ask=94)]
+def test_idle_summary_falls_back_to_approximate_mids():
+    # No book estimates yet, but the quoted books are tight: the closest miss
+    # is still reported, marked as approximate.
+    markets = [mk("A", yes_bid=92, yes_ask=94), mk("Z", yes_bid=5, yes_ask=7)]
     text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
-    assert "no tradeable book estimates yet" in text
+    assert "closest: A" in text
+    assert "~" in text
+
+
+def test_idle_summary_when_books_are_uninformative():
+    markets = [mk("A", yes_ask=94)]  # one-sided book: no information at all
+    text = idle_watch_summary(markets, estimates={}, portfolio_fraction=1 / 3, now=NOW)
+    assert "books too wide or one-sided" in text
 
 
 def test_idle_summary_empty():
