@@ -104,6 +104,17 @@ Nothing trades without passing, in order:
 Halts cancel resting orders and block all entries; reduce-only exits remain
 allowed. State survives restarts (SQLite).
 
+Two details worth knowing:
+
+- **Baselines are scoped per mode** (`paper:demo`, `live:prod`, ...). Paper
+  equity never becomes the loss baseline for your live account, so switching
+  modes cannot trip a phantom halt.
+- **`kalshi-bot resume` re-baselines.** It clears the halts *and* makes
+  current equity the new day anchor and high-water mark -- "accept where we
+  are, carry on." Use it after any halt you've reviewed, and after a
+  **deposit or withdrawal** (an external cash movement looks like P&L to the
+  breakers; resume tells the bot it wasn't).
+
 ---
 
 ## Setup
@@ -272,6 +283,24 @@ Design choices that matter:
 - **The exchange is the source of truth** for cash and positions in live
   mode; the local DB only attributes them to strategies and remembers
   history. Restarts therefore can't double-spend.
+
+## Troubleshooting
+
+**"Daily loss halt / drawdown halt right after switching modes or
+depositing/withdrawing."** The breakers compare equity against a stored
+baseline; an external change (different bankroll, cash moved on/off the
+exchange) looks like a giant loss or gain. Run `kalshi-bot resume` (or the
+GUI Resume button) -- it clears the halts and re-baselines to current
+equity. Since v1.2 baselines are mode-scoped, so the paper-to-live switch
+can't cause this in the first place; deposits/withdrawals still warrant a
+resume.
+
+**"I want a completely fresh start."** `kalshi-bot paper-reset` wipes the
+simulated portfolio, its history and its risk baselines (live state is
+untouched). For live mode, the exchange is the source of truth -- deleting
+the state DB (`%APPDATA%\KalshiBot\state.sqlite3` for the app,
+`state/kalshi_bot.sqlite3` for the CLI) only loses local history and
+strategy attribution, never positions or cash.
 
 ## Known limitations
 

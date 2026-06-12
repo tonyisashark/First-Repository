@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     mtm_micro     INTEGER,
     resting_micro INTEGER,
     equity_micro  INTEGER,
-    note          TEXT DEFAULT ''
+    note          TEXT DEFAULT '',
+    mode          TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS paper_positions (
     ticker     TEXT PRIMARY KEY,
@@ -89,6 +90,10 @@ class StateStore:
         # the GUI reads from its own connections while the bot writes
         self.conn.execute("PRAGMA busy_timeout=5000")
         self.conn.executescript(_SCHEMA)
+        try:  # migrate pre-1.2 databases created without the mode column
+            self.conn.execute("ALTER TABLE snapshots ADD COLUMN mode TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         self.conn.commit()
 
     def close(self) -> None:
@@ -204,25 +209,31 @@ class StateStore:
 
     # ------------------------------------------------------------ snapshots
     def save_snapshot(self, ts: int, cash: int, mtm: int, resting: int,
-                      equity: int, note: str = "") -> None:
+                      equity: int, note: str = "", mode: str = "") -> None:
         self.conn.execute(
             "INSERT OR REPLACE INTO snapshots (ts, cash_micro, mtm_micro, resting_micro,"
-            " equity_micro, note) VALUES (?,?,?,?,?,?)",
-            (ts, cash, mtm, resting, equity, note),
+            " equity_micro, note, mode) VALUES (?,?,?,?,?,?,?)",
+            (ts, cash, mtm, resting, equity, note, mode),
         )
         self.conn.commit()
 
-    def latest_snapshot(self) -> Optional[Tuple[int, int, int, int, int]]:
+    def latest_snapshot(self, mode: Optional[str] = None
+                        ) -> Optional[Tuple[int, int, int, int, int]]:
+        where, params = ("WHERE mode=?", (mode,)) if mode is not None else ("", ())
         row = self.conn.execute(
             "SELECT ts, cash_micro, mtm_micro, resting_micro, equity_micro "
-            "FROM snapshots ORDER BY ts DESC LIMIT 1"
+            f"FROM snapshots {where} ORDER BY ts DESC LIMIT 1", params
         ).fetchone()
         return tuple(row) if row else None
 
-    def snapshots_since(self, since_ts: int) -> List[Tuple[int, int]]:
-        rows = self.conn.execute(
-            "SELECT ts, equity_micro FROM snapshots WHERE ts >= ? ORDER BY ts", (since_ts,)
-        ).fetchall()
+    def snapshots_since(self, since_ts: int,
+                        mode: Optional[str] = None) -> List[Tuple[int, int]]:
+        query = "SELECT ts, equity_micro FROM snapshots WHERE ts >= ?"
+        params: tuple = (since_ts,)
+        if mode is not None:
+            query += " AND mode=?"
+            params += (mode,)
+        rows = self.conn.execute(query + " ORDER BY ts", params).fetchall()
         return [(int(a), int(b)) for a, b in rows]
 
     # ------------------------------------------------------------ paper book
@@ -278,10 +289,13 @@ class StateStore:
         return cur.rowcount > 0
 
     def paper_reset(self) -> None:
+        """Fresh simulated bankroll: positions, orders, cash, the paper-scoped
+        risk anchors/halts, and the paper equity history all start over."""
         for table in ("paper_positions", "paper_orders"):
             self.conn.execute(f"DELETE FROM {table}")
-        for key in ("paper_cash_micro",):
-            self.conn.execute("DELETE FROM kv WHERE key=?", (key,))
+        self.conn.execute("DELETE FROM kv WHERE key=?", ("paper_cash_micro",))
+        self.conn.execute("DELETE FROM kv WHERE key LIKE 'paper:%'")
+        self.conn.execute("DELETE FROM snapshots WHERE mode LIKE 'paper:%'")
         self.conn.commit()
 
     # --------------------------------------------------------------- journal

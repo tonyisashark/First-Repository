@@ -8,6 +8,13 @@ Nothing opens a position without passing through here. Two halts exist:
   ``max_drawdown_halt_frac``, or the operator ran ``kalshi-bot kill``:
   persists until ``kalshi-bot resume``.
 
+All baselines and halts are **scoped per mode** (``cfg.mode_key``: paper vs
+live, demo vs prod), so a $1,000 paper run can never become the loss
+baseline for a smaller live bankroll. ``resume`` clears the halts *and*
+re-baselines the day anchor and high-water mark to current equity --
+"accept where we are and carry on" -- which is also the right tool after a
+deposit or withdrawal shifts equity for reasons that are not trading P&L.
+
 Position sizing uses fractional Kelly on the *estimated* edge, then clamps
 to per-market / per-event / per-series / global exposure caps and available
 cash. Estimated edges are exactly that -- estimates -- which is why the
@@ -55,6 +62,10 @@ class RiskManager:
     def __init__(self, cfg: Config, state: StateStore) -> None:
         self.cfg = cfg
         self.state = state
+        self.namespace = cfg.mode_key
+
+    def _key(self, base: str) -> str:
+        return f"{self.namespace}/{base}"
 
     # ------------------------------------------------------------- breakers
     def assess(self, view: PortfolioView, today: Optional[str] = None) -> RiskStatus:
@@ -65,17 +76,19 @@ class RiskManager:
         status.day_anchor = anchor
         status.day_pnl = view.equity - anchor
 
-        hwm = max(self.state.kv_get_int(KV_HWM, 0), view.equity)
-        self.state.kv_set(KV_HWM, hwm)
+        hwm = max(self.state.kv_get_int(self._key(KV_HWM), 0), view.equity)
+        self.state.kv_set(self._key(KV_HWM), hwm)
         status.hwm = hwm
         status.drawdown_frac = 1 - (view.equity / hwm) if hwm > 0 else 0.0
 
         if anchor > 0 and status.day_pnl <= -self.cfg.daily_loss_halt_frac * anchor:
-            if self.state.kv_get(KV_HALT_DAY) != today:
-                self.state.kv_set(KV_HALT_DAY, today)
+            if self.state.kv_get(self._key(KV_HALT_DAY)) != today:
+                self.state.kv_set(self._key(KV_HALT_DAY), today)
                 self.state.journal("halt_daily", {
-                    "day_pnl_micro": status.day_pnl, "anchor_micro": anchor})
-                logger.warning("DAILY LOSS HALT: day P&L %.2f USD <= -%.1f%% of anchor",
+                    "day_pnl_micro": status.day_pnl, "anchor_micro": anchor,
+                    "mode": self.namespace})
+                logger.warning("DAILY LOSS HALT: day P&L %.2f USD <= -%.1f%% of anchor"
+                               " (run `kalshi-bot resume` to re-baseline now)",
                                status.day_pnl / 1e6,
                                self.cfg.daily_loss_halt_frac * 100)
 
@@ -83,11 +96,11 @@ class RiskManager:
         # everything at zero) must not latch the manual halt.
         if status.drawdown_frac >= self.cfg.max_drawdown_halt_frac \
                 and hwm > 0 and view.equity > 0:
-            if not self.state.kv_get(KV_HALT_MANUAL):
-                self.state.kv_set(KV_HALT_MANUAL, "max_drawdown")
+            if not self.state.kv_get(self._key(KV_HALT_MANUAL)):
+                self.state.kv_set(self._key(KV_HALT_MANUAL), "max_drawdown")
                 self.state.journal("halt_drawdown", {
                     "drawdown_frac": status.drawdown_frac, "hwm_micro": hwm,
-                    "equity_micro": view.equity})
+                    "equity_micro": view.equity, "mode": self.namespace})
                 logger.error("MAX DRAWDOWN HALT: %.1f%% below high-water mark; "
                              "run `kalshi-bot resume` to re-enable trading",
                              status.drawdown_frac * 100)
@@ -98,7 +111,7 @@ class RiskManager:
         return status
 
     def _day_anchor(self, view: PortfolioView, today: str) -> int:
-        raw = self.state.kv_get(KV_DAY_ANCHOR)
+        raw = self.state.kv_get(self._key(KV_DAY_ANCHOR))
         if raw:
             try:
                 data = json.loads(raw)
@@ -107,28 +120,35 @@ class RiskManager:
             except (ValueError, TypeError):
                 pass
         if view.equity > 0:
-            self.state.kv_set(KV_DAY_ANCHOR,
+            self.state.kv_set(self._key(KV_DAY_ANCHOR),
                               json.dumps({"date": today, "equity": view.equity}))
         return view.equity
 
     def entries_blocked(self, today: Optional[str] = None) -> tuple[bool, List[str]]:
         today = today or utc_day()
         reasons = []
-        manual = self.state.kv_get(KV_HALT_MANUAL)
+        manual = self.state.kv_get(self._key(KV_HALT_MANUAL))
         if manual:
             reasons.append(f"manual/drawdown halt ({manual})")
-        if self.state.kv_get(KV_HALT_DAY) == today:
+        if self.state.kv_get(self._key(KV_HALT_DAY)) == today:
             reasons.append("daily loss halt")
         return bool(reasons), reasons
 
     def resume(self) -> None:
-        self.state.kv_delete(KV_HALT_MANUAL)
-        self.state.kv_delete(KV_HALT_DAY)
-        self.state.journal("resume", {})
+        """Clear halts AND re-baseline: current equity becomes the new day
+        anchor and high-water mark on the next cycle. Without this the same
+        stale baseline would re-trip the breakers immediately. Also the right
+        call after a deposit/withdrawal moves equity for non-trading reasons.
+        """
+        self.state.kv_delete(self._key(KV_HALT_MANUAL))
+        self.state.kv_delete(self._key(KV_HALT_DAY))
+        self.state.kv_delete(self._key(KV_DAY_ANCHOR))
+        self.state.kv_delete(self._key(KV_HWM))
+        self.state.journal("resume", {"mode": self.namespace, "rebaselined": True})
 
     def kill(self, reason: str = "operator kill switch") -> None:
-        self.state.kv_set(KV_HALT_MANUAL, reason)
-        self.state.journal("halt_manual", {"reason": reason})
+        self.state.kv_set(self._key(KV_HALT_MANUAL), reason)
+        self.state.journal("halt_manual", {"reason": reason, "mode": self.namespace})
 
     # --------------------------------------------------------------- sizing
     def kelly_count(self, p: float, cost_per_contract: int, payout: int,

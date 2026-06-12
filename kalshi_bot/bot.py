@@ -198,7 +198,8 @@ class TradingBot:
 
         if now >= self._snapshot_due:
             self.state.save_snapshot(now, view.cash, view.mtm,
-                                     view.resting_escrow, view.equity)
+                                     view.resting_escrow, view.equity,
+                                     mode=self.cfg.mode_key)
             self._snapshot_due = now + self.cfg.snapshot_interval_seconds
 
         if not status.halted:

@@ -102,7 +102,7 @@ def cmd_status(cfg: Config, _args) -> int:
     from .risk import RiskManager
 
     state = StateStore(cfg.state_db_path)
-    snap = state.latest_snapshot()
+    snap = state.latest_snapshot(cfg.mode_key)
     print(f"mode: {'paper' if cfg.dry_run else 'live'} ({cfg.env})")
     if snap:
         ts, cash, mtm, resting, equity = snap
@@ -111,7 +111,7 @@ def cmd_status(cfg: Config, _args) -> int:
         print(f"  cash {micro_to_display(cash)} | positions {micro_to_display(mtm)}"
               f" | resting escrow {micro_to_display(resting)}")
         day_ago = ts - 86_400
-        history = state.snapshots_since(day_ago)
+        history = state.snapshots_since(day_ago, cfg.mode_key)
         if len(history) > 1:
             first = history[0][1]
             if first:

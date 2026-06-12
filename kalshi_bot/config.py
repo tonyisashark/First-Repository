@@ -162,6 +162,15 @@ class Config:
         """True only when real prod orders are both requested and acknowledged."""
         return (not self.dry_run) and self.env == "prod"
 
+    @property
+    def mode_key(self) -> str:
+        """Namespace for mode-scoped state (risk anchors, equity snapshots).
+
+        Paper and live bankrolls are different universes: a $1,000 paper run
+        must never become the loss baseline for a $100 live account.
+        """
+        return f"{'paper' if self.dry_run else 'live'}:{self.env}"
+
     def validate(self) -> None:
         if self.env not in ("demo", "prod"):
             raise ValueError(f"KALSHI_ENV must be 'demo' or 'prod', got {self.env!r}")

@@ -86,6 +86,43 @@ def test_kill_switch(cfg, state):
     assert not risk.entries_blocked()[0]
 
 
+def test_resume_rebaselines_instead_of_relatching(cfg, state):
+    """After resume, the SAME low equity must not re-trip the breakers."""
+    risk = RiskManager(cfg, state)
+    risk.assess(view_with(1000 * USD), today="2026-06-12")
+    status = risk.assess(view_with(700 * USD), today="2026-06-12")  # -30%
+    assert status.halted                       # daily + drawdown both latched
+
+    risk.resume()
+    status = risk.assess(view_with(700 * USD), today="2026-06-12")
+    assert not status.halted
+    assert status.day_anchor == 700 * USD      # current equity is the new anchor
+    assert status.hwm == 700 * USD             # ...and the new high-water mark
+    assert status.drawdown_frac == 0.0
+
+
+def test_paper_baselines_never_contaminate_live(cfg, state):
+    """The reported bug: $1,000 paper run, then live mode with a $100 balance
+    must not be perceived as a 90% loss."""
+    paper_risk = RiskManager(cfg, state)                      # dry_run=True
+    paper_risk.assess(view_with(1000 * USD), today="2026-06-12")
+
+    live_cfg = Config(env="prod", dry_run=False,
+                      state_db_path=cfg.state_db_path)
+    live_risk = RiskManager(live_cfg, state)
+    assert live_risk.namespace != paper_risk.namespace
+
+    status = live_risk.assess(view_with(100 * USD), today="2026-06-12")
+    assert not status.halted
+    assert status.day_anchor == 100 * USD
+    assert status.hwm == 100 * USD
+
+    # and halts stay scoped: killing paper does not block live, or vice versa
+    paper_risk.kill("paper experiment")
+    assert paper_risk.entries_blocked()[0]
+    assert not live_risk.entries_blocked()[0]
+
+
 def test_clamp_order(cfg, state):
     risk = RiskManager(cfg, state)
     market = mk("T")

@@ -454,6 +454,12 @@ class App:
     def _db_path(self) -> str:
         return os.environ.get("STATE_DB_PATH") or str(default_db_path())
 
+    def _mode_key(self) -> str:
+        """Mode namespace matching Config.mode_key, from the current form."""
+        env = str(self.vars["KALSHI_ENV"].get()) or "demo"
+        dry = bool(self.vars["DRY_RUN"].get())
+        return f"{'paper' if dry else 'live'}:{env}"
+
     # ---------------------------------------------------------------- ticks
     def _tick(self) -> None:
         try:
@@ -551,7 +557,8 @@ class App:
         points = []
         try:
             state = StateStore(self._db_path())
-            points = state.snapshots_since(int(time.time()) - CHART_WINDOW_S)
+            points = state.snapshots_since(int(time.time()) - CHART_WINDOW_S,
+                                           self._mode_key())
             state.close()
         except Exception:
             pass

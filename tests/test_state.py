@@ -37,6 +37,47 @@ def test_snapshots(state: StateStore):
     assert state.snapshots_since(150) == [(200, 7)]
 
 
+def test_snapshots_scoped_by_mode(state: StateStore):
+    state.save_snapshot(100, 0, 0, 0, 1000, mode="paper:demo")
+    state.save_snapshot(200, 0, 0, 0, 90, mode="live:prod")
+    assert state.snapshots_since(0, "paper:demo") == [(100, 1000)]
+    assert state.snapshots_since(0, "live:prod") == [(200, 90)]
+    assert state.latest_snapshot("paper:demo")[4] == 1000
+    assert state.latest_snapshot("missing:mode") is None
+    assert len(state.snapshots_since(0)) == 2      # unfiltered sees both
+
+
+def test_migration_adds_mode_column_to_old_databases(tmp_path):
+    import sqlite3
+
+    path = str(tmp_path / "old.sqlite3")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE snapshots (ts INTEGER PRIMARY KEY, cash_micro INTEGER,"
+                 " mtm_micro INTEGER, resting_micro INTEGER, equity_micro INTEGER,"
+                 " note TEXT DEFAULT '')")
+    conn.execute("INSERT INTO snapshots VALUES (100, 0, 0, 0, 1000, '')")
+    conn.commit()
+    conn.close()
+
+    migrated = StateStore(path)
+    migrated.save_snapshot(200, 0, 0, 0, 90, mode="live:prod")
+    assert migrated.snapshots_since(0, "live:prod") == [(200, 90)]
+    assert len(migrated.snapshots_since(0)) == 2   # old row survives, mode=''
+    migrated.close()
+
+
+def test_paper_reset_clears_paper_risk_state_only(state: StateStore):
+    state.kv_set("paper:demo/risk_hwm_equity", 999)
+    state.kv_set("live:prod/risk_hwm_equity", 111)
+    state.save_snapshot(100, 0, 0, 0, 1000, mode="paper:demo")
+    state.save_snapshot(200, 0, 0, 0, 90, mode="live:prod")
+    state.paper_reset()
+    assert state.kv_get("paper:demo/risk_hwm_equity") is None
+    assert state.kv_get_int("live:prod/risk_hwm_equity") == 111
+    assert state.snapshots_since(0, "paper:demo") == []
+    assert state.snapshots_since(0, "live:prod") == [(200, 90)]
+
+
 def test_paper_tables(state: StateStore):
     state.paper_set_position("T", 5, 100)
     assert state.paper_positions() == {"T": (5, 100)}
