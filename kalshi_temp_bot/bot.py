@@ -79,6 +79,12 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0  # "I'm alive" status-line cadence
 BOOK_POLL_SECONDS = 5.0            # per-ticker order-book fetch cadence
 BUY_TIMEOUT_SECONDS = 30.0         # cancel an unfilled entry order after this
 LIQUIDITY_EXIT_BUFFER = 2.0        # sell when exit-side depth <= this x position
+# Take-profit: the strategy harvests convergence rather than holding to
+# settlement, so the same bankroll cycles through several edges a day. Sell
+# once the bid (net of the exit fee) locks a real gain over the all-in entry
+# cost AND holding to settlement adds almost nothing over selling right now.
+TAKE_PROFIT_MIN_GAIN_CENTS = 1.0   # locked gain must beat this
+TAKE_PROFIT_REMAINING_CENTS = 1.0  # holding must add less than this
 # After a forced exit, don't re-enter the same market for a while: the exit
 # means either its liquidity is draining or the model and the market disagree
 # sharply -- flipping straight back in would just churn fees on noise.
@@ -576,7 +582,8 @@ class TradingBot:
 
     def _begin_holding(self, trade: Trade) -> None:
         logger.info(
-            "Holding %g %s %s; exits: depth <= %.1fx position, edge reversal >= %.0fc, else settle",
+            "Holding %g %s %s; exits: take-profit on convergence, depth <= %.1fx position, "
+            "edge reversal >= %.0fc, else settle",
             trade.count, trade.ticker, trade.side.upper(),
             LIQUIDITY_EXIT_BUFFER, EXIT_EDGE_CENTS,
         )
@@ -627,8 +634,10 @@ class TradingBot:
         return False
 
     def _trade_manage_holding(self, trade: Trade, markets: List[MarketView]) -> bool:
-        # Positions are deliberately carried through market close (they settle);
-        # only the liquidity and edge-reversal exits can sell.
+        # The preferred exit is the take-profit harvest (sell once the market
+        # has converged and paid the edge, freeing the slot for the next one);
+        # liquidity and edge-reversal exits protect the downside, and only a
+        # position the market never pays for is carried through to settlement.
         market = self._market_for(markets, trade.ticker)
         if market is None:
             # Closed or temporarily missing from the scan: nothing actionable,
@@ -680,6 +689,23 @@ class TradingBot:
                     trade.ticker, trade.side.upper(), side_bid, sell_value, chance,
                 )
                 return self._force_exit(trade, "edge-reversal")
+
+            # 3) Take-profit: the market converged and paid the edge. Selling
+            #    now banks a real gain over the all-in entry cost, and holding
+            #    to settlement would add almost nothing in expectation --
+            #    recycle the bankroll into the next dislocation instead. No
+            #    re-entry cooldown: the entry bar guards against churn.
+            if trade.buy_price is not None:
+                cost_basis = trade.buy_price + taker_fee_cents(trade.buy_price)
+                locked = sell_value - cost_basis
+                remaining = chance - sell_value
+                if locked >= TAKE_PROFIT_MIN_GAIN_CENTS and remaining < TAKE_PROFIT_REMAINING_CENTS:
+                    logger.info(
+                        "%s %s bid %dc locks %+.1fc over %.1fc cost; holding adds only %.1fc "
+                        "-- taking profit",
+                        trade.ticker, trade.side.upper(), side_bid, locked, cost_basis, remaining,
+                    )
+                    return self._force_exit(trade, "take-profit", cooldown=False)
         return False
 
     def _settled_flat(self, trade: Trade) -> bool:
@@ -701,8 +727,11 @@ class TradingBot:
             return True
         return False
 
-    def _force_exit(self, trade: Trade, reason: str) -> bool:
-        self._exited_at[trade.ticker] = time.time()
+    def _force_exit(self, trade: Trade, reason: str, cooldown: bool = True) -> bool:
+        if cooldown:
+            # Defensive exits sit out for a while; a take-profit harvest may
+            # re-enter as soon as a fresh edge clears the bar.
+            self._exited_at[trade.ticker] = time.time()
         if self.cfg.dry_run:
             logger.info(
                 "[PAPER] %s %s sold at market (%s) -- position closed",

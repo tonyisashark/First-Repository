@@ -18,6 +18,7 @@ from kalshi_temp_bot.strategy import (
     parse_time,
     position_size,
     renormalized_estimates,
+    required_edge_cents,
     seconds_to_close,
     select_trade_candidates,
     side_quotes,
@@ -266,14 +267,41 @@ def test_skips_markets_closing_too_soon():
     # Identical edges in two separate events; only the close time differs.
     markets = [
         mk("SOON", event="E1", yes_bid=91, yes_ask=92, close_in_s=60),
-        mk("Z1", event="E1", yes_bid=2, yes_ask=4),
+        mk("Z1", event="E1", yes_bid=2, yes_ask=3),
         mk("LATER", event="E2", yes_bid=91, yes_ask=92, close_in_s=9999),
-        mk("Z2", event="E2", yes_bid=2, yes_ask=4),
+        mk("Z2", event="E2", yes_bid=2, yes_ask=3),
     ]
     est = renormalized_estimates(markets, {"SOON": 91.5, "LATER": 91.5})
     cands = select_trade_candidates(
         markets, estimates=est, portfolio_fraction=1 / 3, min_seconds_to_close=300, now=NOW)
     assert {c.market.ticker for c in cands} == {"LATER"}
+
+
+def test_edge_bar_scales_with_spread_and_time_to_close():
+    # Floor: tight book, no close time -> 2c + half the 1c spread.
+    assert required_edge_cents(mk("A", yes_bid=50, yes_ask=51), NOW) == pytest.approx(2.5)
+    # Wide book: each cent of spread adds half a cent of bar.
+    assert required_edge_cents(mk("B", yes_bid=40, yes_ask=50), NOW) == pytest.approx(7.0)
+    # Far from close: +0.15c/hour, capped at +3c.
+    assert required_edge_cents(
+        mk("C", yes_bid=50, yes_ask=51, close_in_s=10 * 3600), NOW) == pytest.approx(4.0)
+    assert required_edge_cents(
+        mk("D", yes_bid=50, yes_ask=51, close_in_s=40 * 3600), NOW) == pytest.approx(5.5)
+
+
+def test_same_edge_trades_near_close_but_not_hours_out():
+    # A 3c measured edge on a wide-open morning market is indistinguishable
+    # from estimator noise (winner's curse); the identical reading minutes
+    # from settlement is reliable and trades.
+    for close_in_s, should_trade in ((20 * 3600, False), (1800, True)):
+        markets = [
+            mk("A", event="E1", yes_bid=91, yes_ask=92, close_in_s=close_in_s),
+            mk("Z", event="E1", yes_bid=2, yes_ask=3),
+        ]
+        est = renormalized_estimates(markets, {"A": 91.5})
+        cands = select_trade_candidates(
+            markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
+        assert bool(cands) is should_trade, f"close_in_s={close_in_s}"
 
 
 def test_best_candidate_maximizes_growth():
@@ -282,9 +310,10 @@ def test_best_candidate_maximizes_growth():
         mk("BIG", yes_bid=89, yes_ask=90),
         mk("Z", yes_bid=2, yes_ask=3),
     ]
-    # Pre-renormalized estimates passed directly: SMALL has a 2.6c gross edge,
-    # BIG a 6c one; growth must prefer BIG.
-    est = {"SMALL": 96.6, "BIG": 96.0}
+    # Pre-renormalized estimates passed directly: SMALL has a 3c gross edge,
+    # BIG a 6c one; both clear the scaled bar (2.5c at a 1c spread, no close
+    # time) and growth must prefer BIG.
+    est = {"SMALL": 97.0, "BIG": 96.0}
     cands = select_trade_candidates(markets, estimates=est, portfolio_fraction=1 / 3, now=NOW)
     assert {c.market.ticker for c in cands} == {"SMALL", "BIG"}
     best = best_candidate(cands)

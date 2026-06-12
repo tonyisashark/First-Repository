@@ -26,7 +26,8 @@ edge -- YES or NO.
    YES at the ask, NO at ``100 - bid`` -- including Kalshi's taker fee
    (``0.07 * P * (1-P)`` per contract). ``edge = estimate - all-in cost``.
 
-3. Selection: among sides with ``edge >= MIN_EDGE_CENTS``, rank by expected
+3. Selection: among sides clearing an uncertainty-scaled edge bar (floor
+   ``MIN_EDGE_CENTS``, rising with spread and time to close), rank by expected
    log-growth of the bankroll at the fraction that will actually be deployed
    (the configured portfolio fraction, capped at the Kelly fraction so a thin
    edge is never over-bet). The single highest-growth side is bought.
@@ -42,9 +43,15 @@ from typing import Dict, List, Optional
 # --- self-tuned constants (chosen from market structure, not user input) -----
 # Kalshi's taker fee: 0.07 * price * (1 - price) dollars per contract.
 TAKER_FEE_RATE = 0.07
-# Minimum net edge (cents) required to trade: covers estimate noise so the bot
-# only acts when the model and the price genuinely disagree.
+# Minimum net edge (cents) required to trade. This is only the FLOOR: the
+# live bar scales with estimate uncertainty (see required_edge_cents). A flat
+# bar at the estimator's noise floor suffers a winner's curse -- trades fire
+# exactly when the noise overshoots -- so wide books and far-from-close
+# markets must show proportionally more edge before they may trade.
 MIN_EDGE_CENTS = 2.0
+SPREAD_EDGE_FACTOR = 0.5            # +0.5c of bar per 1c of quoted spread
+HOURLY_EDGE_PREMIUM_CENTS = 0.15    # +0.15c of bar per hour to close ...
+MAX_TIME_PREMIUM_CENTS = 3.0        # ... capped at +3c (20h out)
 # Exit a held position when the market's bid overprices our side by this much
 # (net of the exit fee) -- the model says cashing out now beats holding.
 EXIT_EDGE_CENTS = 3.0
@@ -312,6 +319,26 @@ def evaluate_side(
     )
 
 
+def required_edge_cents(market: MarketView, now: Optional[datetime] = None) -> float:
+    """The net edge a side must clear to trade *this* market right now.
+
+    The bar scales with the two live measures of estimate uncertainty: the
+    quoted spread (the market's own error bar on its price) and the time to
+    close (hours out, the outcome distribution is genuinely wide; minutes
+    out it is nearly decided). A tight book late in the day trades at ~3c;
+    a wide morning book needs 6c+ -- which kills the noise trades without
+    touching real dislocations.
+    """
+    bar = MIN_EDGE_CENTS
+    bid, ask = market.yes_bid, market.yes_ask
+    if bid is not None and ask is not None and ask >= bid:
+        bar += SPREAD_EDGE_FACTOR * (ask - bid)
+    stc = seconds_to_close(market, now or datetime.now(timezone.utc))
+    if stc is not None and stc > 0:
+        bar += min(MAX_TIME_PREMIUM_CENTS, HOURLY_EDGE_PREMIUM_CENTS * stc / 3600.0)
+    return bar
+
+
 def select_trade_candidates(
     markets: List[MarketView],
     *,
@@ -335,11 +362,12 @@ def select_trade_candidates(
         stc = seconds_to_close(market, now)
         if stc is not None and stc < min_seconds_to_close:
             continue
+        bar = max(min_edge_cents, required_edge_cents(market, now))
         for side in ("yes", "no"):
             cand = evaluate_side(market, side, estimate, portfolio_fraction)
             if cand is None:
                 continue
-            if cand.edge_cents >= min_edge_cents and cand.growth > 0.0:
+            if cand.edge_cents >= bar and cand.growth > 0.0:
                 candidates.append(cand)
     return candidates
 
@@ -431,8 +459,9 @@ def idle_watch_summary(
     if near is None:
         return f"{head} | books too wide or one-sided to estimate (off-hours lull?)"
     approx = "" if near.market.ticker in estimates else "~"
+    need = required_edge_cents(near.market, now)
     return (
-        f"{head} | no side above the +{MIN_EDGE_CENTS:.0f}c edge bar | best edge: "
+        f"{head} | no side above its edge bar | best edge: "
         f"{near.market.ticker} {near.side.upper()} est {approx}{near.chance_cents:.1f}% "
-        f"@ {near.price_cents}c edge {approx}{near.edge_cents:+.1f}c"
+        f"@ {near.price_cents}c edge {approx}{near.edge_cents:+.1f}c (needs +{need:.1f}c)"
     )

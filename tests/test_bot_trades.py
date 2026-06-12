@@ -55,15 +55,16 @@ def mv(ticker, *, event="E", yes_bid=91, yes_ask=92, volume=1000, close_in_s=5 *
 
 
 def filler(event="E", ticker=None):
-    # A complementary low bucket so the event's asks sum to 96 (< 100: buying
+    # A complementary low bucket so the event's asks sum to 95 (< 100: buying
     # the whole event at ask beats its certain payout): renormalization lifts
-    # the big bucket's estimate to ~95.4%, above its 92c ask -> a YES edge.
-    return mv(ticker or f"ZF_{event}", event=event, yes_bid=2, yes_ask=4, volume=1)
+    # the big bucket's estimate to ~96.4%, above its 92c ask -> a YES edge of
+    # ~3.9c, clearing the scaled bar (~3.25c at a 1c spread, 5h to close).
+    return mv(ticker or f"ZF_{event}", event=event, yes_bid=2, yes_ask=3, volume=1)
 
 
 def edge_book():
     # Matches mv() defaults: bid 91 (500 deep), ask 92 (400 deep) -> microprice
-    # ~91.56; with the filler the renormalized estimate is ~95.4%.
+    # ~91.56; with the filler the renormalized estimate is ~96.4%.
     return {"yes": [[91, 500]], "no": [[8, 400]]}
 
 
@@ -289,15 +290,32 @@ def test_edge_reversal_exit_cashes_out_an_overpriced_bid():
     assert bot.trades == []
 
 
-def test_winner_is_not_dumped_by_edge_exit():
+def test_take_profit_harvests_a_converged_winner():
+    # The strategy cashes several edges a day from one slot: once the market
+    # converges and pays the edge (bid nets a real gain over the all-in cost,
+    # holding adds < 1c), the position is sold and the slot freed -- it is NOT
+    # ridden to settlement for the last fraction of a cent.
+    bot = make_bot(client=FakeBookClient(), max_positions=1)
+    a = edged_universe(bot)
+    bot.tick()
+    assert bot.trades[0].state is TradeState.HOLDING  # bought at 92c
+
+    a.yes_bid, a.yes_ask = 98, 100
+    bot.client.books["A"] = {"yes": [[98, 100_000]], "no": [[1, 100_000]]}
+    bot.tick()
+    assert bot.trades == []                   # paper sell: position closed
+    assert "A" not in bot._exited_at          # harvest -> no re-entry cooldown
+
+
+def test_unconverged_position_is_held_not_harvested():
+    # Bid only 1c above entry: selling would lock < 1c and abandon the bulk of
+    # the edge -- keep holding until the market actually pays.
     bot = make_bot(client=FakeBookClient(), max_positions=1)
     a = edged_universe(bot)
     bot.tick()
 
-    # Riding toward settlement: bid 98/ask 100, event sum stays sane -> the
-    # estimate (~98+) exceeds the bid; no reversal, keep riding.
-    a.yes_bid, a.yes_ask = 98, 100
-    bot.client.books["A"] = {"yes": [[98, 100_000]], "no": [[1, 100_000]]}
+    a.yes_bid, a.yes_ask = 93, 94
+    bot.client.books["A"] = {"yes": [[93, 500]], "no": [[6, 400]]}
     bot.tick()
     assert bot.trades[0].state is TradeState.HOLDING
 
