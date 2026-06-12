@@ -93,6 +93,41 @@ def test_immature_estimate_does_not_trade():
     assert [t.ticker for t in bot.trades] == ["A"]
 
 
+def test_background_coverage_estimates_far_from_edge_markets():
+    # Both buckets sit ~10c below the edge bar (well outside the prefilter
+    # slack), so neither earns a "hot" fetch. Background coverage must spend
+    # the leftover budget on them anyway: estimates need to exist (and be
+    # maturing) *before* a market drifts toward an edge, not after.
+    client = FakeBookClient({
+        "W": {"yes": [[40, 100]], "no": [[44, 100]]},   # bid 40 / ask 56
+        "X": {"yes": [[42, 100]], "no": [[42, 100]]},   # bid 42 / ask 58
+    })
+    bot = make_bot(client=client, max_positions=1)
+    set_markets(bot, [
+        mv("W", yes_bid=40, yes_ask=56),
+        mv("X", yes_bid=42, yes_ask=58),                # same event: no renorm
+    ])
+    bot.tick()
+    assert bot.trades == []                             # no edge anywhere
+    assert {"W", "X"} <= set(bot._fresh_micro())        # but both estimated
+
+
+def test_background_coverage_waits_for_its_cadence():
+    # Background polls run on the slow cadence; a just-polled market must not
+    # be re-fetched every tick (that budget belongs to near-edge markets).
+    client = FakeBookClient({"W": {"yes": [[40, 100]], "no": [[44, 100]]}})
+    bot = make_bot(client=client, max_positions=1)
+    bot.book_poll_seconds = 10_000                      # isolate the slow path
+    bot.background_poll_seconds = 10_000
+    set_markets(bot, [
+        mv("W", yes_bid=40, yes_ask=56),
+        mv("X", yes_bid=42, yes_ask=58),                # same event: no renorm
+    ])
+    bot._book_polled_at["W"] = time.time()              # polled moments ago
+    bot.tick()
+    assert "W" not in bot._fresh_micro()
+
+
 def test_no_orderbook_capability_means_no_trades():
     bot = make_bot(client=FakeClient(), max_positions=1)
     set_markets(bot, [mv("A"), filler()])

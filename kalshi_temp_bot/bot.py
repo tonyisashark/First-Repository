@@ -71,7 +71,10 @@ logger = logging.getLogger(__name__)
 
 # --- self-tuned timing / risk constants --------------------------------------
 POLL_INTERVAL_SECONDS = 1.0        # decision-loop cadence
-SCAN_INTERVAL_SECONDS = 5.0        # REST market-universe re-scan cadence
+# The market *universe* changes slowly (new buckets list once a day) and live
+# quotes ride the WebSocket, so the REST re-scan can be sparse -- the read
+# budget that frees up goes to order-book fetches (the real estimate input).
+SCAN_INTERVAL_SECONDS = 15.0       # REST market-universe re-scan cadence
 HEARTBEAT_INTERVAL_SECONDS = 30.0  # "I'm alive" status-line cadence
 BOOK_POLL_SECONDS = 5.0            # per-ticker order-book fetch cadence
 BUY_TIMEOUT_SECONDS = 30.0         # cancel an unfilled entry order after this
@@ -92,7 +95,15 @@ SERIES_REQUEST_SPACING = 0.15
 # around -1 to -3c on this measure, so the slack must comfortably cover that.
 # Fetches are budgeted per tick so tracking can't burst past the rate limit.
 PREFILTER_SLACK_CENTS = 8.0
-BOOK_FETCH_BUDGET_PER_TICK = 5
+BOOK_FETCH_BUDGET_PER_TICK = 8
+# Leftover budget after the near-edge list goes to background coverage: a
+# least-recently-polled round-robin over the rest of the universe, so every
+# informative market eventually carries a book-backed estimate. The cadence
+# keeps a series alive (< ESTIMATE_MAX_AGE_SECONDS between samples) and lets
+# it mature (3 samples) within ~a minute of first being seen. Books that came
+# back one-sided/uninformative are re-checked, just much less often.
+BACKGROUND_POLL_SECONDS = 25.0
+UNINFORMATIVE_POLL_SECONDS = 90.0
 # An estimate may only TRADE once it has real history: several book samples
 # over a minimum age. A first glance at a book seeds the EWMA outright, so
 # without this gate one quirky snapshot could buy a position by itself.
@@ -145,6 +156,7 @@ class TradingBot:
         self.scan_interval = SCAN_INTERVAL_SECONDS
         self.heartbeat_interval = HEARTBEAT_INTERVAL_SECONDS
         self.book_poll_seconds = BOOK_POLL_SECONDS
+        self.background_poll_seconds = BACKGROUND_POLL_SECONDS
         self.buy_timeout = BUY_TIMEOUT_SECONDS
         self.ewma_half_life = EWMA_HALF_LIFE_SECONDS
         self.min_estimate_history = MIN_ESTIMATE_HISTORY_SECONDS
@@ -152,6 +164,7 @@ class TradingBot:
 
         self._market_cache: List[MarketView] = []
         self._last_scan: float = 0.0
+        self._scanned_this_tick: bool = False
         self._last_heartbeat: float = 0.0
         self._current_tickers: List[str] = []
         self._running = False
@@ -263,9 +276,11 @@ class TradingBot:
         # Throttle by the scan interval -- *including* when the last scan came
         # back empty. (Re-scanning every tick on an empty result would hammer
         # the API and trigger continuous rate limiting that never recovers.)
+        self._scanned_this_tick = False
         if self._last_scan == 0.0 or (now - self._last_scan) >= self.scan_interval:
             self._scan_markets()
             self._last_scan = now
+            self._scanned_this_tick = True
 
         if self.cache is not None:
             for view in self._market_cache:
@@ -396,11 +411,14 @@ class TradingBot:
         return summary
 
     def _update_book_estimates(self, markets: List[MarketView]) -> None:
-        """Fetch order books for the markets most likely to offer an edge.
+        """Fetch order books, hottest markets first, then background coverage.
 
-        A cheap mid-based pass scores every market first; only those within
-        ``PREFILTER_SLACK_CENTS`` of the edge bar get a (budgeted, per-ticker
-        throttled) book fetch -- estimation can't burst past the rate limit.
+        A cheap mid-based pass scores every market; those within
+        ``PREFILTER_SLACK_CENTS`` of the edge bar get first claim on the
+        per-tick fetch budget (at the fast ``book_poll_seconds`` cadence).
+        Whatever budget is left round-robins the rest of the universe at a
+        slower cadence, so the whole board stays estimated without ever
+        bursting past the rate limit.
         """
         mids = {
             m.ticker: mid
@@ -428,14 +446,44 @@ class TradingBot:
                 scored.append((max(edges), market))
 
         now = time.time()
+        # Budget counts *attempts* (rate-limit pressure), not successes.
         fetched = 0
+        hot = set()
         for _, market in sorted(scored, key=lambda pair: -pair[0]):
             if fetched >= BOOK_FETCH_BUDGET_PER_TICK:
-                break
+                return
+            hot.add(market.ticker)
             if (now - self._book_polled_at.get(market.ticker, 0.0)) < self.book_poll_seconds:
                 continue
-            if self._fetch_book(market.ticker, now) is not None:
-                fetched += 1
+            self._fetch_book(market.ticker, now)
+            fetched += 1
+
+        if self._scanned_this_tick:
+            # The scan's per-series requests already used this second's read
+            # allowance; background coverage can wait a tick.
+            return
+        # Leftover budget widens coverage: round-robin the rest of the
+        # universe, least-recently-polled first, so estimates exist (and are
+        # mature) *before* a market drifts toward an edge.
+        backlog: List[Tuple[float, MarketView]] = []
+        for market in markets:
+            if market.ticker in hot:
+                continue
+            mid = mids.get(market.ticker)
+            if mid is not None and not (RAIL_MIN_CENTS <= mid <= RAIL_MAX_CENTS):
+                continue  # settled in all but name; its book adds nothing
+            polled = self._book_polled_at.get(market.ticker, 0.0)
+            cadence = self.background_poll_seconds
+            cached = self._book_cache.get(market.ticker)
+            if cached is not None and (cached[0]["bid"] is None or cached[0]["ask"] is None):
+                cadence = UNINFORMATIVE_POLL_SECONDS
+            if (now - polled) >= cadence:
+                backlog.append((polled, market))
+        for polled, market in sorted(backlog, key=lambda pair: pair[0]):
+            if fetched >= BOOK_FETCH_BUDGET_PER_TICK:
+                break
+            self._fetch_book(market.ticker, now)
+            fetched += 1
 
     # -- entry ---------------------------------------------------------------
     def _maybe_enter(self, markets: List[MarketView]) -> None:
